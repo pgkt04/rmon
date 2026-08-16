@@ -1,0 +1,7 @@
+/dev/nvme0n1p2 / ext4 rw,relatime 0 0
+proc /proc proc rw,nosuid 0 0
+sysfs /sys sysfs rw 0 0
+tmpfs /run tmpfs rw,nosuid 0 0
+/dev/sda1 /data xfs rw,noatime 0 0
+overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0
+/dev/nvme0n1p1 /boot vfat rw 0 0
