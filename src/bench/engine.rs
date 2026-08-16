@@ -78,7 +78,8 @@ fn open_bench_file(path: &Path) -> io::Result<(File, bool)> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        match OpenOptions::new()
+        // fs without O_DIRECT support (e.g. tmpfs) falls through to buffered
+        if let Ok(f) = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -86,8 +87,7 @@ fn open_bench_file(path: &Path) -> io::Result<(File, bool)> {
             .custom_flags(libc::O_DIRECT)
             .open(path)
         {
-            Ok(f) => return Ok((f, true)),
-            Err(_) => {} // fs without O_DIRECT support; fall through to buffered
+            return Ok((f, true));
         }
     }
     let file = OpenOptions::new()

@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: linux-x86_64
+          - os: macos-latest
+            triple: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo build --release
+      - run: tar -C target/release -czf rmon-${{ github.ref_name }}-${{ matrix.triple }}.tar.gz rmon
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: rmon-${{ github.ref_name }}-${{ matrix.triple }}.tar.gz

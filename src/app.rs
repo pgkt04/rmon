@@ -340,7 +340,7 @@ impl App {
             SortBy::Cpu => self
                 .procs
                 .sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(b.rss.cmp(&a.rss))),
-            SortBy::Mem => self.procs.sort_by(|a, b| b.rss.cmp(&a.rss)),
+            SortBy::Mem => self.procs.sort_by_key(|p| std::cmp::Reverse(p.rss)),
             SortBy::Io => self.procs.sort_by(|a, b| {
                 let key = |p: &ProcRow| p.io_bps.unwrap_or(f64::NEG_INFINITY);
                 key(b).total_cmp(&key(a)).then(b.rss.cmp(&a.rss))
