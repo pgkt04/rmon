@@ -5,6 +5,7 @@ mod graph;
 mod mem;
 mod meter;
 mod net;
+mod picker;
 mod proc;
 mod theme;
 
@@ -23,6 +24,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     dsk::draw(f, app, dsk_area);
     proc::draw(f, app, proc_area);
     mem::draw(f, app, mem_area);
+    if let Some(p) = &app.picker {
+        picker::draw(f, p, f.area());
+    }
 }
 
 /// one source of truth for the frame layout; the mouse handler hit-tests with it
@@ -51,6 +55,35 @@ fn panels(area: Rect, app: &App) -> [Rect; 5] {
 
 /// wheel scrolls the proc list, click selects a row - btop style
 pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
+    // the picker is modal: wheel moves, click runs a row, click outside closes
+    if let Some(p) = &mut app.picker {
+        let n = p.entries.len();
+        let area = picker::popup_rect(frame, n);
+        match m.kind {
+            MouseEventKind::ScrollUp => p.selected = p.selected.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                p.selected = (p.selected + 1).min(n.saturating_sub(1));
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !area.contains(Position::new(m.column, m.row)) {
+                    app.picker = None;
+                    return;
+                }
+                let first = area.y + 1;
+                if m.row >= first && m.row + 1 < area.y + area.height {
+                    let idx = (m.row - first) as usize;
+                    if idx < n {
+                        let target = p.entries[idx].path.clone();
+                        app.picker = None;
+                        app.bench = Some(crate::app::BenchState::default());
+                        app.bench_target = Some(target);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
     let [_, _, _, proc_area, _] = panels(frame, app);
     if !proc_area.contains(Position::new(m.column, m.row)) {
         return;
@@ -85,7 +118,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn fake_app() -> App {
+    pub(super) fn fake_app() -> App {
         let mut app = App::default();
         app.cpu_history = (0..120)
             .map(|i| (i as f64 * 0.35).sin().abs() * 85.0)
@@ -325,5 +358,92 @@ mod tests {
         let [_, _, _, proc_area, _] = panels(Rect::new(0, 0, 100, 46), &app);
         let col = proc_right_column(&term, proc_area);
         assert!(col.iter().all(|s| s != "█" && s != "░"), "{col:?}");
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::tests::fake_app;
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    fn open_picker(app: &mut App) {
+        app.on_event(crate::app::AppEvent::Key(KeyEvent::from(KeyCode::Char(
+            'b',
+        ))));
+        assert!(app.picker.is_some());
+    }
+
+    #[test]
+    fn picker_popup_renders_entries_over_panels() {
+        let backend = TestBackend::new(100, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        app.bench = None; // fake_app has a running bench; clear so b opens the picker
+        open_picker(&mut app);
+        term.draw(|f| draw(f, &app)).unwrap();
+        let text: String = {
+            let buf = term.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text.contains("bench target"), "popup title renders");
+        assert!(text.contains("free"), "mount rows show free space");
+        assert!(text.contains("temp dir"), "fallback entry present");
+    }
+
+    #[test]
+    fn picker_wheel_moves_and_click_starts() {
+        let frame = Rect::new(0, 0, 100, 46);
+        let mut app = fake_app();
+        app.bench = None;
+        open_picker(&mut app);
+        let n = app.picker.as_ref().unwrap().entries.len();
+        let area = picker::popup_rect(frame, n);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollDown), frame);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1);
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp), frame);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+        // click on the second row starts a bench there
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 2,
+            row: area.y + 2,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, frame);
+        assert!(app.picker.is_none());
+        assert!(app.bench_target.is_some());
+    }
+
+    #[test]
+    fn picker_click_outside_closes() {
+        let frame = Rect::new(0, 0, 100, 46);
+        let mut app = fake_app();
+        app.bench = None;
+        open_picker(&mut app);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, frame);
+        assert!(app.picker.is_none());
+        assert!(app.bench_target.is_none());
     }
 }

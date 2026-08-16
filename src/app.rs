@@ -57,6 +57,21 @@ pub enum SortBy {
     Io,
 }
 
+/// one row in the bench target prompt
+#[derive(Debug, Clone)]
+pub struct BenchTarget {
+    pub path: std::path::PathBuf,
+    /// free bytes for mount rows; None for the temp dir entry
+    pub available: Option<u64>,
+}
+
+/// modal prompt opened by `b`: pick which filesystem to benchmark
+#[derive(Debug, Clone)]
+pub struct BenchPicker {
+    pub entries: Vec<BenchTarget>,
+    pub selected: usize,
+}
+
 #[derive(Default)]
 pub struct App {
     pub quit: bool,
@@ -73,7 +88,9 @@ pub struct App {
     pub sort: SortBy,
     pub status: Option<String>,
     pub bench: Option<BenchState>,
-    pub bench_requested: bool,
+    /// set by the picker; the run loop takes it and spawns the bench thread
+    pub bench_target: Option<std::path::PathBuf>,
+    pub picker: Option<BenchPicker>,
     pub smart: Vec<SmartInfo>,
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
@@ -122,6 +139,24 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        // the picker is modal: it swallows every key until it closes
+        if let Some(p) = &mut self.picker {
+            match k.code {
+                KeyCode::Up => p.selected = p.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    p.selected = (p.selected + 1).min(p.entries.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let target = p.entries[p.selected].path.clone();
+                    self.picker = None;
+                    self.bench = Some(BenchState::default());
+                    self.bench_target = Some(target);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => self.picker = None,
+                _ => {}
+            }
+            return;
+        }
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
@@ -146,11 +181,32 @@ impl App {
                     .as_ref()
                     .is_some_and(|b| b.error.is_none() && b.results.len() < 4);
                 if !running {
-                    self.bench_requested = true;
+                    self.open_bench_picker();
                 }
             }
             _ => {}
         }
+    }
+
+    /// mounts by free space, biggest first, with the temp dir as the last resort
+    fn open_bench_picker(&mut self) {
+        let mut entries: Vec<BenchTarget> = self
+            .mounts
+            .iter()
+            .map(|m| BenchTarget {
+                path: std::path::PathBuf::from(&m.mount_point),
+                available: Some(m.available),
+            })
+            .collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.available));
+        entries.push(BenchTarget {
+            path: std::env::temp_dir(),
+            available: None,
+        });
+        self.picker = Some(BenchPicker {
+            entries,
+            selected: 0,
+        });
     }
 
     fn apply(&mut self, s: Snapshot) {
@@ -500,15 +556,82 @@ mod tests {
         assert_eq!(app.procs[1].pid, 2);
     }
 
+    fn mount(point: &str, available: u64) -> MountInfo {
+        MountInfo {
+            mount_point: point.into(),
+            total: available * 2,
+            available,
+        }
+    }
+
     #[test]
-    fn b_requests_bench_once() {
+    fn b_opens_picker_sorted_by_free_space() {
+        let mut app = App {
+            mounts: vec![mount("/small", 10), mount("/big", 1000)],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
+        let p = app.picker.as_ref().expect("picker opens");
+        assert_eq!(p.entries[0].path, std::path::PathBuf::from("/big"));
+        assert_eq!(p.entries[1].path, std::path::PathBuf::from("/small"));
+        // temp dir is always the last resort entry
+        assert_eq!(p.entries.last().unwrap().path, std::env::temp_dir());
+        assert_eq!(p.selected, 0);
+        assert!(app.bench_target.is_none(), "prompt, do not start");
+    }
+
+    #[test]
+    fn picker_enter_starts_bench_at_selection() {
+        let mut app = App {
+            mounts: vec![mount("/big", 1000)],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Down)));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Enter)));
+        assert!(app.picker.is_none());
+        assert_eq!(app.bench_target, Some(std::env::temp_dir()));
+        assert!(app.bench.is_some(), "bench state resets on start");
+    }
+
+    #[test]
+    fn picker_selection_clamps() {
+        let mut app = App {
+            mounts: vec![mount("/a", 1)],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Up)));
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+        for _ in 0..9 {
+            app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Down)));
+        }
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1); // 2 entries
+    }
+
+    #[test]
+    fn picker_escape_closes_without_bench_and_q_does_not_quit() {
         let mut app = App::default();
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
-        assert!(app.bench_requested);
-        app.bench_requested = false;
-        app.bench = Some(BenchState::default()); // running
+        assert!(app.picker.is_some());
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('q'))));
+        assert!(app.picker.is_none());
+        assert!(!app.quit, "q closes the picker, not the app");
+        assert!(app.bench_target.is_none());
+        // esc works the same way
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
-        assert!(!app.bench_requested, "no re-request while running");
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(app.picker.is_none() && !app.quit);
+    }
+
+    #[test]
+    fn b_ignored_while_bench_runs() {
+        let mut app = App {
+            bench: Some(BenchState::default()), // running
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
+        assert!(app.picker.is_none(), "no picker while a bench runs");
     }
 
     #[test]

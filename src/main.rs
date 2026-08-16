@@ -103,18 +103,9 @@ fn run(
             Ok(ev) => app.on_event(ev),
             Err(_) => break,
         }
-        if app.bench_requested {
-            app.bench_requested = false;
-            app.bench = Some(app::BenchState::default());
-            // biggest mount is the most interesting target; skip unwritable
-            // mount roots (e.g. macos sealed `/`) and fall back to temp dir
-            let target = app
-                .mounts
-                .iter()
-                .max_by_key(|m| m.available)
-                .map(|m| std::path::PathBuf::from(&m.mount_point))
-                .filter(|dir| dir_writable(dir))
-                .unwrap_or_else(std::env::temp_dir);
+        // the picker (b key) chose a target; unwritable dirs surface as a
+        // clean bench error in the panel, so no probe needed here
+        if let Some(target) = app.bench_target.take() {
             let bench_tx = tx_bench.clone();
             thread::spawn(move || {
                 let cfg = bench::BenchConfig {
@@ -128,20 +119,4 @@ fn run(
         }
     }
     Ok(())
-}
-
-/// can we create a file here? mount roots are often read-only or root-owned
-fn dir_writable(dir: &std::path::Path) -> bool {
-    let probe = dir.join(format!(".rmon-probe-{}", std::process::id()));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-    {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
 }

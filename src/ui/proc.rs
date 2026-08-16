@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -9,8 +9,6 @@ use ratatui::widgets::{
 use super::fmt::{humanize, rate};
 use super::theme;
 use crate::app::{App, SortBy};
-
-const SELECTED_BG: Color = Color::Rgb(45, 50, 65);
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let sort = match app.sort {
@@ -78,7 +76,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]);
         let row = if i == app.selected {
-            row.style(Style::new().bg(SELECTED_BG))
+            row.style(Style::new().bg(theme::SELECTED_BG))
         } else {
             row
         };

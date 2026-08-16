@@ -4,6 +4,7 @@ pub const BORDER: Color = Color::Rgb(60, 70, 90);
 pub const TITLE: Color = Color::Rgb(180, 190, 220);
 pub const LABEL: Color = Color::Rgb(140, 150, 170);
 pub const METER_EMPTY: Color = Color::Rgb(50, 55, 70);
+pub const SELECTED_BG: Color = Color::Rgb(45, 50, 65);
 
 /// btop-style load gradient: green -> yellow -> red across 0..=100
 pub fn gradient(pct: f64) -> Color {
