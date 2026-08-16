@@ -72,7 +72,12 @@ fn main() -> Result<()> {
                     }
                 }
                 Ok(_) => {} // resize redraws on next event
-                Err(_) => return,
+                Err(_) => {
+                    // the tty is gone (ssh drop, tmux kill); tell main to exit
+                    // instead of drawing to a dead pty forever
+                    let _ = tx.send(AppEvent::Quit);
+                    return;
+                }
             }
         }
     });

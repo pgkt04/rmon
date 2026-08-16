@@ -16,6 +16,8 @@ pub enum AppEvent {
     Smart(Vec<SmartInfo>),
     /// handled in the run loop, which knows the frame size; never reaches on_event
     Mouse(MouseEvent),
+    /// the input thread lost the tty; exit instead of running headless forever
+    Quit,
 }
 
 #[derive(Default)]
@@ -114,6 +116,7 @@ impl App {
             AppEvent::CollectError(e) => self.status = Some(e),
             AppEvent::Smart(v) => self.smart = v,
             AppEvent::Mouse(_) => {} // run loop consumes these before on_event
+            AppEvent::Quit => self.quit = true,
             AppEvent::Bench(ev) => {
                 let st = self.bench.get_or_insert_with(BenchState::default);
                 match ev {
@@ -632,6 +635,14 @@ mod tests {
         };
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
         assert!(app.picker.is_none(), "no picker while a bench runs");
+    }
+
+    #[test]
+    fn quit_event_exits_even_mid_picker() {
+        let mut app = App::default();
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
+        app.on_event(AppEvent::Quit);
+        assert!(app.quit, "tty loss must exit despite the modal picker");
     }
 
     #[test]
