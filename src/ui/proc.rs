@@ -84,7 +84,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     }
     f.render_widget(Paragraph::new(lines), inner);
 
-    // btop-style scroll position over the right border, only when the list overflows
+    // scroll position over the right border, only when the list overflows
     if app.procs.len() > visible {
         let mut state = ScrollbarState::new(app.procs.len()).position(app.selected);
         f.render_stateful_widget(

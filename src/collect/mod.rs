@@ -102,6 +102,8 @@ pub struct Snapshot {
     pub cpu_temp_c: Option<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
+    pub load_avg: Option<[f64; 3]>,
+    pub uptime_secs: Option<u64>,
     pub taken: Instant,
 }
 
@@ -118,6 +120,8 @@ impl Default for Snapshot {
             cpu_temp_c: None,
             gpu_name: None,
             gpu_util_pct: None,
+            load_avg: None,
+            uptime_secs: None,
             taken: Instant::now(),
         }
     }
@@ -127,6 +131,13 @@ pub trait Collector: Send {
     fn collect(&mut self) -> Result<Snapshot, CollectError>;
 }
 
+/// 1/5/15 minute load averages; same libc call on linux and macos
+pub fn load_avg() -> Option<[f64; 3]> {
+    let mut l = [0f64; 3];
+    // SAFETY: getloadavg writes at most 3 doubles into a 3-double buffer
+    let n = unsafe { libc::getloadavg(l.as_mut_ptr(), 3) };
+    (n == 3).then_some(l)
+}
 /// busy percent between two readings, clamped 0..=100
 pub fn cpu_percent(prev: CpuTimes, curr: CpuTimes) -> f64 {
     let busy = curr.busy.saturating_sub(prev.busy);

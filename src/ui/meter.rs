@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 
 use super::theme;
 
-/// one-line btop-style meter: `label ⣿⣿⣿⣀⣀⣀ text`
+/// one-line meter: `label ⣿⣿⣿⣀⣀⣀ text`
 /// filled cells take the gradient color of their own position
 pub fn meter(label: &str, pct: f64, text: &str, width: u16) -> Line<'static> {
     let pct = pct.clamp(0.0, 100.0);

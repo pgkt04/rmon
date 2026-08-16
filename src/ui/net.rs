@@ -47,8 +47,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     if inner.height < 1 {
         return;
     }
+    // download stacks over upload at full width; side-by-side halves
+    // read as one confusing band
     let [rx_area, tx_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
     graph(f, &app.net_rx, RX, rx_area);
     graph(f, &app.net_tx, TX, tx_area);
 }

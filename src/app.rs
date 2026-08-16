@@ -6,7 +6,9 @@ use crate::bench::{BenchEvent, TestKind, TestResult};
 use crate::collect::{MemSnapshot, MountInfo, Snapshot, cpu_percent};
 use crate::smart::SmartInfo;
 
-pub const HISTORY: usize = 300;
+// braille packs 2 samples per char column: 720 samples fill a 360-col
+// terminal; 300 could never reach the left edge past 150 chars
+pub const HISTORY: usize = 720;
 
 pub enum AppEvent {
     Snapshot(Box<Snapshot>),
@@ -98,6 +100,8 @@ pub struct App {
     pub cpu_temp_c: Option<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
+    pub load_avg: Option<[f64; 3]>,
+    pub uptime_secs: Option<u64>,
     prev: Option<Snapshot>,
 }
 
@@ -331,6 +335,8 @@ impl App {
         self.cpu_temp_c = s.cpu_temp_c;
         self.gpu_name = s.gpu_name.clone();
         self.gpu_util_pct = s.gpu_util_pct;
+        self.load_avg = s.load_avg;
+        self.uptime_secs = s.uptime_secs;
         self.status = None;
         self.prev = Some(s);
     }

@@ -1,7 +1,7 @@
 //! cpu identity, die temperature, and gpu utilization for macos.
 //!
-//! temperature uses the PRIVATE IOHIDEventSystemClient API (the same one btop
-//! uses); gpu utilization reads the public IOAccelerator registry entry's
+//! temperature uses the PRIVATE IOHIDEventSystemClient API (a well-known
+//! monitoring API); gpu utilization reads the public IOAccelerator registry entry's
 //! PerformanceStatistics dictionary. signatures below were verified by a live
 //! FFI probe on this machine — do not "correct" them from public headers.
 //!
@@ -175,7 +175,7 @@ fn avg(v: &[f64]) -> Option<f64> {
 }
 
 /// cpu die temperature in °C: average of `PMU tdie*` sensors, falling back to
-/// `eACC*`/`pACC*`, then `SOC MTR Temp Sensor*` (btop's chain)
+/// `eACC*`/`pACC*`, then `SOC MTR Temp Sensor*`
 pub fn cpu_temp() -> Option<f64> {
     let client = hid_sensor_client()?;
     // SAFETY: client is live; Copy -> we own the services array

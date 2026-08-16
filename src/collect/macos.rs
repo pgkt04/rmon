@@ -197,6 +197,8 @@ impl Collector for MacCollector {
             // one SoC: the gpu carries the cpu brand (Activity Monitor does the same)
             gpu_name: brand,
             gpu_util_pct: super::macos_sensors::gpu_util(),
+            load_avg: super::load_avg(),
+            uptime_secs: uptime_secs(),
             taken: std::time::Instant::now(),
         })
     }
@@ -207,6 +209,33 @@ fn cached_cpu_brand() -> Option<String> {
     static BRAND: std::sync::LazyLock<Option<String>> =
         std::sync::LazyLock::new(super::macos_sensors::cpu_brand);
     BRAND.clone()
+}
+
+/// seconds since boot via kern.boottime (a timeval of the boot moment)
+fn uptime_secs() -> Option<u64> {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = size_of::<libc::timeval>();
+    // SAFETY: kern.boottime fills exactly one timeval; len carries the size
+    let rc = unsafe {
+        sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            &mut tv as *mut _ as *mut c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || tv.tv_sec <= 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    now.checked_sub(tv.tv_sec as u64)
 }
 
 fn mounts_snapshot() -> Vec<MountInfo> {

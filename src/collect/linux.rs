@@ -394,9 +394,24 @@ impl Collector for LinuxCollector {
             cpu_temp_c,
             gpu_name,
             gpu_util_pct,
+            load_avg: super::load_avg(),
+            uptime_secs: std::fs::read_to_string("/proc/uptime")
+                .ok()
+                .and_then(|s| parse_uptime(&s)),
             taken: std::time::Instant::now(),
         })
     }
+}
+
+/// /proc/uptime: `<uptime seconds> <idle seconds>`
+// Only called by the cfg(linux) LinuxCollector, but unit-tested on every OS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_uptime(s: &str) -> Option<u64> {
+    s.split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .map(|v| v as u64)
 }
 
 #[cfg(test)]
@@ -452,6 +467,13 @@ mod tests {
     #[test]
     fn meminfo_missing_total_is_error() {
         assert!(parse_meminfo("MemFree: 5 kB\n").is_err());
+    }
+
+    #[test]
+    fn uptime_first_field_in_seconds() {
+        assert_eq!(parse_uptime("93784.21 501223.94\n"), Some(93_784));
+        assert_eq!(parse_uptime("garbage"), None);
+        assert_eq!(parse_uptime(""), None);
     }
 
     #[test]

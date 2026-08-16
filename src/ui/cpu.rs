@@ -1,16 +1,20 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
+use super::fmt::duration_short;
 use super::meter::meter;
 use super::{BrailleGraph, theme};
 use crate::app::App;
 
+/// per-column width inside the core overlay: `c00 ⣿⣿⣀… 46.6%`
+const CORE_COL_W: u16 = 24;
+
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let total = app.cpu_history.back().copied().unwrap_or(0.0);
-    // ` cpu Apple M1 Pro 44°C ` — identity parts render only when known
+    // ` cpu Apple M1 Pro 44°C 14.8% up 3d 4h ` — parts render only when known
     let mut ident = String::new();
     if let Some(name) = &app.cpu_name {
         ident.push_str(name);
@@ -30,6 +34,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         format!("{total:5.1}% "),
         Style::new().fg(theme::gradient(total)),
     ));
+    if let Some(up) = app.uptime_secs {
+        title.push(Span::styled(
+            format!("up {} ", duration_short(up)),
+            Style::new().fg(theme::LABEL),
+        ));
+    }
     let title = Line::from(title);
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -47,20 +57,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // core meters sit in a compact grid under the graph, btop style; the gpu
-    // meter row takes one line from the graph so nothing gets clipped:
-    // grid <= height/2 and gpu <= 1 always fit the inner budget (height >= 2)
-    let gpu_rows = app.gpu_util_pct.is_some() as u16;
-    let ncores = app.core_percents.len() as u16;
-    let cols: u16 = if ncores > 8 { 2 } else { 1 };
-    let grid_rows = ncores.div_ceil(cols).min(inner.height / 2);
-    let [graph_area, cores_area, gpu_area] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(grid_rows),
-        Constraint::Length(gpu_rows),
-    ])
-    .areas(inner);
-
+    // the history graph owns the whole box
     let vals: Vec<f64> = app.cpu_history.iter().copied().collect();
     f.render_widget(
         BrailleGraph {
@@ -69,15 +66,62 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             style: Style::default(),
             gradient: true,
         },
-        graph_area,
+        inner,
     );
 
-    if let Some(util) = app.gpu_util_pct
-        && gpu_area.height > 0
-    {
+    // core meters, gpu, and load avg float in a box over the graph's right
+    // side instead of stealing full-width rows under it
+    overlay(f, app, inner);
+}
+
+fn overlay(f: &mut Frame, app: &App, inner: Rect) {
+    let ncores = app.core_percents.len() as u16;
+    let content_rows = ncores.div_ceil(2)
+        + u16::from(app.gpu_util_pct.is_some())
+        + u16::from(app.load_avg.is_some());
+    if content_rows == 0 {
+        return;
+    }
+    let w = (CORE_COL_W * 2 + 3).min(inner.width); // 2 cols + borders + gap
+    let h = (content_rows + 2).min(inner.height);
+    if w < CORE_COL_W || h < 3 {
+        return; // not enough room to say anything useful
+    }
+    let area = Rect::new(
+        inner.x + inner.width - w,
+        inner.y + (inner.height - h) / 2,
+        w,
+        h,
+    );
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::BORDER));
+    let box_inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = ncores.div_ceil(2);
+    let col_w = box_inner.width.saturating_sub(1) / 2;
+    let mut lines: Vec<Line> = Vec::new();
+    for row in 0..rows {
+        // column-major: c0..c4 left, c5..c9 right
+        let mut spans = Vec::new();
+        for col in 0..2u16 {
+            let i = (row + col * rows) as usize;
+            let Some(pct) = app.core_percents.get(i) else {
+                continue;
+            };
+            if col == 1 {
+                spans.push(Span::raw(" "));
+            }
+            spans.extend(meter(&format!("c{i:02}"), *pct, &format!("{pct:5.1}%"), col_w).spans);
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(util) = app.gpu_util_pct {
         let pct = format!("{util:.1}%");
         // truncate the name so label, bar, and right text share the row
-        let max_name = (gpu_area.width as usize).saturating_sub(3 + 2 + pct.len() + 9);
+        let max_name = (box_inner.width as usize).saturating_sub(3 + 2 + pct.len() + 9);
         let name: String = app
             .gpu_name
             .as_deref()
@@ -90,33 +134,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         } else {
             format!("{name} {pct}")
         };
-        f.render_widget(
-            Paragraph::new(meter("gpu", util, &text, gpu_area.width)),
-            gpu_area,
-        );
+        lines.push(meter("gpu", util, &text, box_inner.width));
     }
-
-    if grid_rows == 0 {
-        return;
+    if let Some([one, five, fifteen]) = app.load_avg {
+        lines.push(Line::from(Span::styled(
+            format!("load {one:.2} {five:.2} {fifteen:.2}"),
+            Style::new().fg(theme::LABEL),
+        )));
     }
-    let col_areas = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols as usize])
-        .split(cores_area);
-    for (i, pct) in app.core_percents.iter().enumerate() {
-        // column-major: fill the first column top to bottom, then the next
-        let col = i as u16 / grid_rows;
-        let row = i as u16 % grid_rows;
-        if col >= cols {
-            break; // terminal too short for every core
-        }
-        let cell = col_areas[col as usize];
-        let line_area = Rect {
-            y: cell.y + row,
-            height: 1,
-            ..cell
-        };
-        // one space of breathing room between grid columns
-        let width = line_area.width.saturating_sub(1);
-        let line = meter(&format!("c{i:02}"), *pct, &format!("{pct:5.1}%"), width);
-        f.render_widget(Paragraph::new(line), line_area);
-    }
+    f.render_widget(Paragraph::new(lines), box_inner);
 }

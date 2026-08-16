@@ -34,20 +34,22 @@ fn panels(area: Rect, app: &App) -> [Rect; 5] {
     // meters + borders; swap meter only exists when the host has swap
     let mem_rows = if app.mem.swap_total > 0 { 5 } else { 4 };
     let [cpu_area, net_area, band, mem_area] = Layout::vertical([
-        Constraint::Fill(2),
-        Constraint::Length(6),
+        // a 0-100 scaled graph in a huge box is mostly blank at idle; keep
+        // the cpu box short and dense
+        Constraint::Percentage(30),
+        Constraint::Length(8),
         Constraint::Fill(3),
         Constraint::Length(mem_rows),
     ])
     .areas(area);
-    // dsk and proc share the tall middle band, btop style; the split keeps
+    // dsk and proc share the tall middle band; the split keeps
     // the proc name column from swimming in blank space on wide terminals
     let [dsk_area, proc_area] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(band);
     [cpu_area, net_area, dsk_area, proc_area, mem_area]
 }
 
-/// wheel scrolls the proc list, click selects a row - btop style
+/// wheel scrolls the proc list, click selects a row
 pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
     // the picker is modal: wheel moves, click runs a row, click outside closes
     if let Some(p) = &mut app.picker {
@@ -168,6 +170,8 @@ mod tests {
         app.cpu_temp_c = Some(44.2);
         app.gpu_name = Some("Apple M1 Pro".into());
         app.gpu_util_pct = Some(22.0);
+        app.load_avg = Some([2.14, 1.82, 1.53]);
+        app.uptime_secs = Some(93_784);
         app
     }
 
@@ -286,9 +290,11 @@ mod tests {
         let title_row = text.lines().next().unwrap();
         assert!(title_row.contains("Apple M1 Pro"), "{title_row}");
         assert!(title_row.contains("44°C"), "{title_row}");
+        assert!(title_row.contains("up 1d 2h"), "{title_row}");
         // gpu meter row: label plus `{name} {util:.1}%` right text
         assert!(text.contains("gpu "));
         assert!(text.contains("Apple M1 Pro 22.0%"));
+        assert!(text.contains("load 2.14 1.82 1.53"));
     }
 
     #[test]
@@ -300,11 +306,15 @@ mod tests {
         app.cpu_temp_c = None;
         app.gpu_name = None;
         app.gpu_util_pct = None;
+        app.load_avg = None;
+        app.uptime_secs = None;
         term.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains(" cpu "));
         assert!(!text.contains("°C"));
         assert!(!text.contains("gpu"));
+        assert!(!text.contains("load "));
+        assert!(!text.contains("up "));
     }
 
     /// the proc panel's right border column, borders excluded (scrollbar track)

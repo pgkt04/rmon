@@ -15,7 +15,7 @@ pub fn braille_cell(left: usize, right: usize) -> char {
     char::from_u32(0x2800 + bits as u32).expect("invariant: braille block is contiguous")
 }
 
-/// btop-style history graph; values 0..=max, newest last, right-aligned
+/// history graph; values 0..=max, newest last, right-aligned
 pub struct BrailleGraph<'a> {
     pub values: &'a [f64],
     pub max: f64,

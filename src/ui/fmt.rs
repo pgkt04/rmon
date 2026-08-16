@@ -22,6 +22,20 @@ pub fn rate(bytes_per_sec: f64) -> String {
     }
 }
 
+/// short uptime: `3d 4h`, `2h 5m`, `12m`, `45s`
+pub fn duration_short(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs / 3_600) % 24, (secs / 60) % 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +52,13 @@ mod tests {
         assert_eq!(rate(0.0), "0 B/s");
         assert_eq!(rate(1536.0), "1.5 KiB/s");
         assert_eq!(rate(2.5 * 1024.0 * 1024.0), "2.5 MiB/s");
+    }
+
+    #[test]
+    fn duration_strings() {
+        assert_eq!(duration_short(45), "45s");
+        assert_eq!(duration_short(12 * 60), "12m");
+        assert_eq!(duration_short(2 * 3600 + 5 * 60), "2h 5m");
+        assert_eq!(duration_short(93_784), "1d 2h");
     }
 }
