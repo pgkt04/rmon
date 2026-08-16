@@ -113,31 +113,40 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let disk_budget = (rows_area.height as usize)
         .saturating_sub(app.mounts.len() + app.smart.len() + benched)
         .max(usize::from(!app.disks.is_empty()));
+    // the panel shares a band with proc now; drop trailing segments as the
+    // rows column narrows instead of clipping mid-number
+    let w = rows_area.width as usize;
     for d in app.disks.iter().take(disk_budget) {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!("{:<8}", d.name), Style::new().fg(theme::TITLE)),
             Span::styled(
-                format!(
-                    " R {:>11} W {:>11} {:>7.0} iops",
-                    rate(d.read_bps),
-                    rate(d.write_bps),
-                    d.iops
-                ),
+                format!(" R {:>11} W {:>11}", rate(d.read_bps), rate(d.write_bps)),
                 Style::new().fg(theme::LABEL),
             ),
-            match d.util_pct {
+        ];
+        if w >= 47 {
+            spans.push(Span::styled(
+                format!(" {:>7.0} iops", d.iops),
+                Style::new().fg(theme::LABEL),
+            ));
+        }
+        if w >= 54 {
+            spans.push(match d.util_pct {
                 Some(u) => Span::styled(format!(" {u:>5.1}%"), Style::new().fg(theme::gradient(u))),
                 None => Span::styled("     —".to_string(), Style::new().fg(theme::LABEL)),
-            },
-            Span::styled(
+            });
+        }
+        if w >= 71 {
+            spans.push(Span::styled(
                 format!(
                     " lat {} q {}",
                     opt(d.lat_ms, |v| format!("{v:>5.2}ms")),
                     opt(d.queue, |v| format!("{v:>4.1}")),
                 ),
                 Style::new().fg(theme::LABEL),
-            ),
-        ]));
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     for m in &app.mounts {
         let used = m.total.saturating_sub(m.available);

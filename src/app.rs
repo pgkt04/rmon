@@ -144,7 +144,8 @@ impl App {
     fn on_key(&mut self, k: KeyEvent) {
         // raw mode turns ctrl+c into a plain key event; honor it from anywhere
         if k.code == KeyCode::Char('c')
-            && k.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
+            && k.modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
         {
             self.quit = true;
             return;

@@ -31,26 +31,20 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 /// one source of truth for the frame layout; the mouse handler hit-tests with it
 fn panels(area: Rect, app: &App) -> [Rect; 5] {
-    // dsk panel height must reserve a row for every line the panel pushes:
-    // disks, mounts, smart rows, and width-wrapped bench lines
-    let inner = Rect::new(0, 0, area.width.saturating_sub(2), 1);
-    let [rows_area, _] = dsk::columns(inner);
-    let bench_rows = app
-        .bench
-        .as_ref()
-        .map_or(0, |b| dsk::bench_rows(b, rows_area.width));
-    let content = app.disks.len() + app.mounts.len() + app.smart.len() + bench_rows;
-    let dsk_rows = content.clamp(1, 8) as u16 + 2;
     // meters + borders; swap meter only exists when the host has swap
     let mem_rows = if app.mem.swap_total > 0 { 5 } else { 4 };
-    Layout::vertical([
+    let [cpu_area, net_area, band, mem_area] = Layout::vertical([
         Constraint::Fill(2),
         Constraint::Length(6),
-        Constraint::Length(dsk_rows),
         Constraint::Fill(3),
         Constraint::Length(mem_rows),
     ])
-    .areas(area)
+    .areas(area);
+    // dsk and proc share the tall middle band, btop style; the split keeps
+    // the proc name column from swimming in blank space on wide terminals
+    let [dsk_area, proc_area] =
+        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(band);
+    [cpu_area, net_area, dsk_area, proc_area, mem_area]
 }
 
 /// wheel scrolls the proc list, click selects a row - btop style
@@ -191,7 +185,8 @@ mod tests {
 
     #[test]
     fn frame_shows_all_panels() {
-        let backend = TestBackend::new(100, 46);
+        // wide enough that the dsk rows column (45% band × 3/5 split) shows iops
+        let backend = TestBackend::new(190, 46);
         let mut term = Terminal::new(backend).unwrap();
         let app = fake_app();
         term.draw(|f| draw(f, &app)).unwrap();
