@@ -15,12 +15,6 @@ fn opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
     v.map(f).unwrap_or_else(|| "    —".into())
 }
 
-/// dsk column split (rows left, io graph right) — shared with the frame-level
-/// panel-height budget in `ui::draw` so both see the same rows width
-pub(super) fn columns(inner: Rect) -> [Rect; 2] {
-    Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).areas(inner)
-}
-
 /// bench result strings greedily packed into lines of at most `width` columns;
 /// shared by the renderer and the row budgets so reserved rows and rendered
 /// rows never disagree (a lone part longer than `width` still gets one line)
@@ -88,34 +82,17 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // rows left, aggregate io graph right
-    let [rows_area, graph_area] = columns(inner);
-
-    let vals: Vec<f64> = app.disk_io.iter().copied().collect();
-    let max = vals.iter().copied().fold(1024.0_f64, f64::max) * 1.1;
-    f.render_widget(
-        BrailleGraph {
-            values: &vals,
-            max,
-            style: Style::new().fg(IO),
-            gradient: false,
-        },
-        graph_area,
-    );
+    let rows_width = inner.width;
 
     let mut lines = Vec::new();
     // mounts, smart, and bench lines render after disks; cap disk rows so they
     // are never pushed below the panel on hosts with many synthetic disks
-    let benched = app
-        .bench
-        .as_ref()
-        .map_or(0, |b| bench_rows(b, rows_area.width));
-    let disk_budget = (rows_area.height as usize)
+    let benched = app.bench.as_ref().map_or(0, |b| bench_rows(b, rows_width));
+    let disk_budget = (inner.height as usize)
         .saturating_sub(app.mounts.len() + app.smart.len() + benched)
         .max(usize::from(!app.disks.is_empty()));
-    // the panel shares a band with proc now; drop trailing segments as the
-    // rows column narrows instead of clipping mid-number
-    let w = rows_area.width as usize;
+    // segments drop off as the panel narrows instead of clipping mid-number
+    let w = rows_width as usize;
     for d in app.disks.iter().take(disk_budget) {
         let mut spans = vec![
             Span::styled(format!("{:<8}", d.name), Style::new().fg(theme::TITLE)),
@@ -163,7 +140,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             &format!("{label:<12}"),
             pct,
             &format!("{:>9} / {}", humanize(used), humanize(m.total)),
-            rows_area.width,
+            rows_width,
         ));
     }
     for s in &app.smart {
@@ -210,14 +187,37 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(IO),
             )));
         }
-        for text in bench_lines(b, rows_area.width) {
+        for text in bench_lines(b, rows_width) {
             lines.push(Line::from(Span::styled(
                 text,
                 Style::new().fg(theme::TITLE),
             )));
         }
     }
+    // rows sit on top; the aggregate io graph gets every leftover row below,
+    // at full width - a tall skinny side column reads as noise
+    let used = (lines.len() as u16).min(inner.height);
+    let rows_area = Rect::new(inner.x, inner.y, inner.width, used);
     f.render_widget(Paragraph::new(lines), rows_area);
+    let graph_area = Rect::new(
+        inner.x,
+        inner.y + used,
+        inner.width,
+        inner.height.saturating_sub(used),
+    );
+    if graph_area.height > 0 {
+        let vals: Vec<f64> = app.disk_io.iter().copied().collect();
+        let max = vals.iter().copied().fold(1024.0_f64, f64::max) * 1.1;
+        f.render_widget(
+            BrailleGraph {
+                values: &vals,
+                max,
+                style: Style::new().fg(IO),
+                gradient: false,
+            },
+            graph_area,
+        );
+    }
 }
 
 #[cfg(test)]

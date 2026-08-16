@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn frame_shows_all_panels() {
-        // wide enough that the dsk rows column (45% band × 3/5 split) shows iops
+        // wide enough that the dsk rows (45% of the band) show every segment
         let backend = TestBackend::new(190, 46);
         let mut term = Terminal::new(backend).unwrap();
         let app = fake_app();
