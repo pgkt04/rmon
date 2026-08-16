@@ -85,6 +85,13 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // wheel and click go to us, not the terminal scrollback
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // ratatui's panic hook restores raw mode and the alt screen but knows
+    // nothing about mouse capture; chain our own disable in front of it
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
     let res = run(&mut terminal, rx, tx_bench);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();

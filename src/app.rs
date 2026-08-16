@@ -142,6 +142,13 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        // raw mode turns ctrl+c into a plain key event; honor it from anywhere
+        if k.code == KeyCode::Char('c')
+            && k.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
+        {
+            self.quit = true;
+            return;
+        }
         // the picker is modal: it swallows every key until it closes
         if let Some(p) = &mut self.picker {
             match k.code {
@@ -643,6 +650,22 @@ mod tests {
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
         app.on_event(AppEvent::Quit);
         assert!(app.quit, "tty loss must exit despite the modal picker");
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_mid_picker() {
+        use ratatui::crossterm::event::KeyModifiers;
+        let mut app = App::default();
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('b'))));
+        assert!(app.picker.is_some());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_event(AppEvent::Key(ctrl_c));
+        assert!(app.quit);
+        // plain c still sorts, does not quit
+        let mut app2 = App::default();
+        app2.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('c'))));
+        assert!(!app2.quit);
+        assert_eq!(app2.sort, SortBy::Cpu);
     }
 
     #[test]
