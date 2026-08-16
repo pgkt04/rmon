@@ -82,13 +82,21 @@ fn overlay(f: &mut Frame, app: &App, inner: Rect) {
     if content_rows == 0 {
         return;
     }
-    let w = (CORE_COL_W * 2 + 3).min(inner.width); // 2 cols + borders + gap
+    // per-core temps take 5 extra cells per column when a sensor reports them
+    let col = if app.core_temps_c.is_empty() {
+        CORE_COL_W
+    } else {
+        CORE_COL_W + 5
+    };
+    let w = (col * 2 + 3).min(inner.width); // 2 cols + borders + gap
     let h = (content_rows + 2).min(inner.height);
-    if w < CORE_COL_W || h < 3 {
+    if w < col || h < 3 {
         return; // not enough room to say anything useful
     }
+    // dead center; the graph flows right-to-left underneath and shows on
+    // both sides of the box
     let area = Rect::new(
-        inner.x + inner.width - w,
+        inner.x + (inner.width - w) / 2,
         inner.y + (inner.height - h) / 2,
         w,
         h,
@@ -114,7 +122,12 @@ fn overlay(f: &mut Frame, app: &App, inner: Rect) {
             if col == 1 {
                 spans.push(Span::raw(" "));
             }
-            spans.extend(meter(&format!("c{i:02}"), *pct, &format!("{pct:5.1}%"), col_w).spans);
+            // right text carries the temp when the sensor reports this core
+            let text = match app.core_temps_c.get(i) {
+                Some(t) => format!("{pct:5.1}% {t:3.0}°"),
+                None => format!("{pct:5.1}%"),
+            };
+            spans.extend(meter(&format!("c{i:02}"), *pct, &text, col_w).spans);
         }
         lines.push(Line::from(spans));
     }

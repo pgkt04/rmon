@@ -174,16 +174,26 @@ fn avg(v: &[f64]) -> Option<f64> {
     (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
 }
 
-/// cpu die temperature in °C: average of `PMU tdie*` sensors, falling back to
-/// `eACC*`/`pACC*`, then `SOC MTR Temp Sensor*`
-pub fn cpu_temp() -> Option<f64> {
-    let client = hid_sensor_client()?;
+/// cpu die temperatures in °C from one sensor enumeration: overall average of
+/// `PMU tdie*` (falling back to `eACC*`/`pACC*`, then `SOC MTR Temp Sensor*`)
+/// plus per-die readings averaged per `PMU tdie<N>` index (duplicates come
+/// from the two PMUs), sorted by index. Nobody documents which index is which
+/// core; the reported order is the best available.
+pub fn cpu_temps() -> (Option<f64>, Vec<f64>) {
+    let Some(client) = hid_sensor_client() else {
+        return (None, Vec::new());
+    };
     // SAFETY: client is live; Copy -> we own the services array
-    let services = Cf::new(unsafe { IOHIDEventSystemClientCopyServices(client.0) })?;
-    let product_key = cfstr("Product")?;
+    let Some(services) = Cf::new(unsafe { IOHIDEventSystemClientCopyServices(client.0) }) else {
+        return (None, Vec::new());
+    };
+    let Some(product_key) = cfstr("Product") else {
+        return (None, Vec::new());
+    };
     // SAFETY: services is a live CFArray
     let count = unsafe { CFArrayGetCount(services.0) };
     let mut tdie = Vec::new();
+    let mut indexed: std::collections::BTreeMap<u32, Vec<f64>> = std::collections::BTreeMap::new();
     let mut acc = Vec::new();
     let mut soc = Vec::new();
     for i in 0..count {
@@ -200,6 +210,9 @@ pub fn cpu_temp() -> Option<f64> {
         let Some(name) = cf_string(product.0) else {
             continue;
         };
+        let index = name
+            .strip_prefix("PMU tdie")
+            .and_then(|rest| rest.parse::<u32>().ok());
         let bucket = if name.starts_with("PMU tdie") {
             &mut tdie
         } else if name.starts_with("eACC") || name.starts_with("pACC") {
@@ -218,9 +231,14 @@ pub fn cpu_temp() -> Option<f64> {
         let t = unsafe { IOHIDEventGetFloatValue(ev.0, TEMPERATURE_FIELD) };
         if t > 0.0 && t < 150.0 {
             bucket.push(t);
+            if let Some(ix) = index {
+                indexed.entry(ix).or_default().push(t);
+            }
         }
     }
-    avg(&tdie).or_else(|| avg(&acc)).or_else(|| avg(&soc))
+    let overall = avg(&tdie).or_else(|| avg(&acc)).or_else(|| avg(&soc));
+    let cores: Vec<f64> = indexed.values().filter_map(|v| avg(v)).collect();
+    (overall, cores)
 }
 
 /// "Device Utilization %" from the entry's PerformanceStatistics, if present
@@ -291,7 +309,7 @@ mod tests {
     #[test]
     fn cpu_temp_is_plausible() {
         // ci macos runners are VMs with no PMU sensors; only assert when present
-        let Some(t) = cpu_temp() else {
+        let Some(t) = cpu_temps().0 else {
             eprintln!("skip: no thermal sensors on this host");
             return;
         };

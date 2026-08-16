@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType};
 use std::collections::VecDeque;
 
-use super::fmt::rate;
+use super::fmt::{humanize, rate};
 use super::{BrailleGraph, theme};
 use crate::app::App;
 
@@ -30,14 +30,26 @@ fn graph(f: &mut Frame, hist: &VecDeque<f64>, color: Color, area: Rect) {
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let rx = app.net_rx.back().copied().unwrap_or(0.0);
     let tx = app.net_tx.back().copied().unwrap_or(0.0);
-    let title = Line::from(vec![
-        Span::styled(
-            " net ",
-            Style::new().fg(theme::TITLE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("↓ {} ", rate(rx)), Style::new().fg(RX)),
-        Span::styled(format!("↑ {} ", rate(tx)), Style::new().fg(TX)),
-    ]);
+    let mut title = vec![Span::styled(
+        " net ",
+        Style::new().fg(theme::TITLE).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(iface) = &app.net_iface {
+        title.push(Span::styled(
+            format!("{iface} "),
+            Style::new().fg(theme::LABEL),
+        ));
+    }
+    // rate now, cumulative since boot in parens
+    title.push(Span::styled(
+        format!("↓ {} ({}) ", rate(rx), humanize(app.net_rx_total)),
+        Style::new().fg(RX),
+    ));
+    title.push(Span::styled(
+        format!("↑ {} ({}) ", rate(tx), humanize(app.net_tx_total)),
+        Style::new().fg(TX),
+    ));
+    let title = Line::from(title);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::BORDER))

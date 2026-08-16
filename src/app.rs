@@ -98,10 +98,14 @@ pub struct App {
     pub smart: Vec<SmartInfo>,
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
+    pub core_temps_c: Vec<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
     pub load_avg: Option<[f64; 3]>,
     pub uptime_secs: Option<u64>,
+    pub net_iface: Option<String>,
+    pub net_rx_total: u64,
+    pub net_tx_total: u64,
     prev: Option<Snapshot>,
 }
 
@@ -333,10 +337,14 @@ impl App {
         self.mounts = s.mounts.clone();
         self.cpu_name = s.cpu_name.clone();
         self.cpu_temp_c = s.cpu_temp_c;
+        self.core_temps_c = s.core_temps_c.clone();
         self.gpu_name = s.gpu_name.clone();
         self.gpu_util_pct = s.gpu_util_pct;
         self.load_avg = s.load_avg;
         self.uptime_secs = s.uptime_secs;
+        self.net_iface = s.net.iface.clone();
+        self.net_rx_total = s.net.rx_bytes;
+        self.net_tx_total = s.net.tx_bytes;
         self.status = None;
         self.prev = Some(s);
     }
@@ -382,6 +390,7 @@ mod tests {
         a.net = NetSnapshot {
             rx_bytes: 1_000,
             tx_bytes: 500,
+            iface: Some("eth0".into()),
         };
         a.procs = vec![ProcessInfo {
             pid: 1,
@@ -396,6 +405,7 @@ mod tests {
         b.net = NetSnapshot {
             rx_bytes: 101_000,
             tx_bytes: 50_500,
+            iface: Some("eth0".into()),
         };
         b.procs = vec![
             ProcessInfo {

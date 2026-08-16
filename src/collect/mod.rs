@@ -46,11 +46,13 @@ pub struct MemSnapshot {
     pub swap_used: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NetSnapshot {
     /// cumulative bytes, loopback excluded
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// busiest non-loopback interface by cumulative traffic
+    pub iface: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +102,8 @@ pub struct Snapshot {
     /// static per boot but cheap; collectors fill every tick
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
+    /// per-core (or per-sensor-group) temps in reported order; empty = unknown
+    pub core_temps_c: Vec<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
     pub load_avg: Option<[f64; 3]>,
@@ -118,6 +122,7 @@ impl Default for Snapshot {
             procs: Vec::new(),
             cpu_name: None,
             cpu_temp_c: None,
+            core_temps_c: Vec::new(),
             gpu_name: None,
             gpu_util_pct: None,
             load_avg: None,

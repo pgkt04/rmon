@@ -185,6 +185,7 @@ pub struct MacCollector;
 impl Collector for MacCollector {
     fn collect(&mut self) -> Result<Snapshot, CollectError> {
         let brand = cached_cpu_brand();
+        let (cpu_temp_c, core_temps_c) = super::macos_sensors::cpu_temps();
         Ok(Snapshot {
             cpu: cpu_snapshot()?,
             mem: mem_snapshot()?,
@@ -193,7 +194,8 @@ impl Collector for MacCollector {
             mounts: mounts_snapshot(),
             procs: procs_snapshot()?,
             cpu_name: brand.clone(),
-            cpu_temp_c: super::macos_sensors::cpu_temp(),
+            cpu_temp_c,
+            core_temps_c,
             // one SoC: the gpu carries the cpu brand (Activity Monitor does the same)
             gpu_name: brand,
             gpu_util_pct: super::macos_sensors::gpu_util(),
@@ -449,6 +451,7 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
     }
 
     let mut net = NetSnapshot::default();
+    let mut best: (u64, u16) = (0, 0); // (traffic, ifm_index)
     let mut off = 0usize;
     while off + size_of::<IfMsghdr2Prefix>() <= len {
         // SAFETY: bounds-checked above; the routing message stream is packed,
@@ -470,9 +473,23 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
             if d.ifi_type != IFT_LOOP {
                 net.rx_bytes += d.ifi_ibytes;
                 net.tx_bytes += d.ifi_obytes;
+                let traffic = d.ifi_ibytes + d.ifi_obytes;
+                if traffic > best.0 {
+                    best = (traffic, hdr.ifm_index);
+                }
             }
         }
         off += hdr.ifm_msglen as usize;
+    }
+    if best.0 > 0 {
+        let mut name = [0u8; libc::IF_NAMESIZE];
+        // SAFETY: buffer is IF_NAMESIZE bytes as the contract requires
+        let p = unsafe { libc::if_indextoname(best.1.into(), name.as_mut_ptr().cast()) };
+        if !p.is_null() {
+            // SAFETY: if_indextoname NUL-terminates on success
+            let s = unsafe { std::ffi::CStr::from_ptr(name.as_ptr().cast()) };
+            net.iface = s.to_str().ok().map(str::to_owned);
+        }
     }
     Ok(net)
 }

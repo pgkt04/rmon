@@ -3,6 +3,11 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release tag to create (e.g. v0.2.0)"
+        required: true
 
 permissions:
   contents: write
@@ -17,12 +22,15 @@ jobs:
           - os: macos-latest
             triple: macos-arm64
     runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
       - run: cargo build --release
-      - run: tar -C target/release -czf rmon-${{ github.ref_name }}-${{ matrix.triple }}.tar.gz rmon
+      - run: tar -C target/release -czf rmon-$TAG-${{ matrix.triple }}.tar.gz rmon
       - uses: softprops/action-gh-release@v2
         with:
-          files: rmon-${{ github.ref_name }}-${{ matrix.triple }}.tar.gz
+          tag_name: ${{ env.TAG }}
+          files: rmon-${{ env.TAG }}-${{ matrix.triple }}.tar.gz

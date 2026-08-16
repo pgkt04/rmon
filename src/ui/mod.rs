@@ -170,6 +170,10 @@ mod tests {
         app.cpu_temp_c = Some(44.2);
         app.gpu_name = Some("Apple M1 Pro".into());
         app.gpu_util_pct = Some(22.0);
+        app.core_temps_c = vec![41.0, 43.5, 44.0, 42.2, 40.9, 39.0, 38.5, 38.0, 37.7, 37.2];
+        app.net_iface = Some("en0".into());
+        app.net_rx_total = 12 << 30;
+        app.net_tx_total = 800 << 20;
         app.load_avg = Some([2.14, 1.82, 1.53]);
         app.uptime_secs = Some(93_784);
         app
@@ -199,7 +203,10 @@ mod tests {
         assert!(text.contains("c00"));
         assert!(text.contains("c09"));
         assert!(text.contains(" net "));
+        assert!(text.contains("en0"));
         assert!(text.contains("↓"));
+        assert!(text.contains("(12.0 GiB)"));
+        assert!(text.contains("(800.0 MiB)"));
         assert!(text.contains("↑"));
         assert!(text.contains(" dsk "));
         assert!(text.contains("disk0"));
@@ -295,6 +302,8 @@ mod tests {
         assert!(text.contains("gpu "));
         assert!(text.contains("Apple M1 Pro 22.0%"));
         assert!(text.contains("load 2.14 1.82 1.53"));
+        // per-core temp rides on the core meter text
+        assert!(text.contains("41°"));
     }
 
     #[test]

@@ -79,6 +79,7 @@ pub fn parse_meminfo(s: &str) -> Result<MemSnapshot, CollectError> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn parse_net_dev(s: &str) -> NetSnapshot {
     let mut net = NetSnapshot::default();
+    let mut best = 0u64;
     for line in s.lines().skip(2) {
         let Some((name, rest)) = line.split_once(':') else {
             continue;
@@ -93,6 +94,10 @@ pub fn parse_net_dev(s: &str) -> NetSnapshot {
         if f.len() >= 9 {
             net.rx_bytes += f[0];
             net.tx_bytes += f[8];
+            if f[0] + f[8] > best {
+                best = f[0] + f[8];
+                net.iface = Some(name.trim().to_owned());
+            }
         }
     }
     net
@@ -235,7 +240,7 @@ const CPU_HWMON: [&str; 4] = ["coretemp", "k10temp", "zenpower", "cpu_thermal"];
 /// scan `base` (/sys/class/hwmon) for the first cpu chip; temp1_input is m°C
 // Only called by the cfg(linux) LinuxCollector, but unit-tested on every OS.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn read_hwmon_cpu_temp(base: &std::path::Path) -> Option<f64> {
+pub fn read_hwmon_cpu_temp(base: &std::path::Path) -> Option<(f64, Vec<f64>)> {
     let mut dirs: Vec<_> = std::fs::read_dir(base)
         .ok()?
         .flatten()
@@ -251,17 +256,56 @@ pub fn read_hwmon_cpu_temp(base: &std::path::Path) -> Option<f64> {
             continue;
         }
         // an unreadable/insane reading should not hide a later valid chip
-        let Some(t) = std::fs::read_to_string(dir.join("temp1_input"))
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .map(|milli| milli / 1000.0)
-            .filter(|t| (0.0..150.0).contains(t))
+        let Some(t) = read_milli_temp(&dir.join("temp1_input")) else {
+            continue;
+        };
+        return Some((t, read_core_temps(&dir)));
+    }
+    None
+}
+
+fn read_milli_temp(path: &std::path::Path) -> Option<f64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .map(|milli| milli / 1000.0)
+        .filter(|t| (0.0..150.0).contains(t))
+}
+
+/// coretemp labels its inputs `Core 0`, `Core 1`, ...; chips without such
+/// labels (k10temp Tctl only) yield an empty vec
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_core_temps(dir: &std::path::Path) -> Vec<f64> {
+    let mut cores: Vec<(u32, f64)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for e in entries.flatten() {
+        let fname = e.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        let Some(n) = fname
+            .strip_prefix("temp")
+            .and_then(|r| r.strip_suffix("_label"))
         else {
             continue;
         };
-        return Some(t);
+        let Ok(label) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let Some(core_ix) = label.trim().strip_prefix("Core ") else {
+            continue;
+        };
+        let Ok(core_ix) = core_ix.parse::<u32>() else {
+            continue;
+        };
+        if let Some(t) = read_milli_temp(&dir.join(format!("temp{n}_input"))) {
+            cores.push((core_ix, t));
+        }
     }
-    None
+    cores.sort_by_key(|(ix, _)| *ix);
+    cores.into_iter().map(|(_, t)| t).collect()
 }
 
 /// numeric suffix of e.g. hwmon12; unknown names sort last
@@ -380,7 +424,7 @@ impl Collector for LinuxCollector {
             .ok()
             .as_deref()
             .and_then(parse_cpuinfo_model);
-        let cpu_temp_c = read_hwmon_cpu_temp(std::path::Path::new("/sys/class/hwmon"));
+        let hwmon = read_hwmon_cpu_temp(std::path::Path::new("/sys/class/hwmon"));
         let (gpu_name, gpu_util_pct) = read_drm_gpu(std::path::Path::new("/sys/class/drm")).unzip();
 
         Ok(Snapshot {
@@ -391,7 +435,8 @@ impl Collector for LinuxCollector {
             mounts,
             procs,
             cpu_name,
-            cpu_temp_c,
+            cpu_temp_c: hwmon.as_ref().map(|(t, _)| *t),
+            core_temps_c: hwmon.map(|(_, c)| c).unwrap_or_default(),
             gpu_name,
             gpu_util_pct,
             load_avg: super::load_avg(),
@@ -481,6 +526,8 @@ mod tests {
         let net = parse_net_dev(NET_DEV);
         assert_eq!(net.rx_bytes, 1_000_000 + 250_000);
         assert_eq!(net.tx_bytes, 500_000 + 125_000);
+        // eth0 carries the most traffic in the fixture
+        assert_eq!(net.iface.as_deref(), Some("eth0"));
     }
 
     #[test]
@@ -582,7 +629,15 @@ mod tests {
         std::fs::create_dir(base.join("hwmon1")).unwrap();
         std::fs::write(base.join("hwmon1/name"), "coretemp\n").unwrap();
         std::fs::write(base.join("hwmon1/temp1_input"), "44000\n").unwrap();
-        assert_eq!(read_hwmon_cpu_temp(&base), Some(44.0));
+        assert_eq!(read_hwmon_cpu_temp(&base), Some((44.0, vec![])));
+        // per-core labels appear in coretemp style
+        std::fs::write(base.join("hwmon1/temp2_label"), "Core 0\n").unwrap();
+        std::fs::write(base.join("hwmon1/temp2_input"), "41000\n").unwrap();
+        std::fs::write(base.join("hwmon1/temp3_label"), "Core 1\n").unwrap();
+        std::fs::write(base.join("hwmon1/temp3_input"), "43000\n").unwrap();
+        std::fs::write(base.join("hwmon1/temp4_label"), "Package id 0\n").unwrap();
+        std::fs::write(base.join("hwmon1/temp4_input"), "45000\n").unwrap();
+        assert_eq!(read_hwmon_cpu_temp(&base), Some((44.0, vec![41.0, 43.0])));
     }
 
     #[test]
