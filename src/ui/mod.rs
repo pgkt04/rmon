@@ -41,9 +41,9 @@ fn panels(area: Rect, app: &App) -> [Rect; 5] {
         // a 0-100 scaled graph in a huge box is mostly blank at idle; keep
         // the cpu box short and dense
         Constraint::Percentage(30),
-        // per-interface rows on top, aggregate graph below; tall enough for
-        // a couple interfaces plus a graph on typical terminals
-        Constraint::Length(12),
+        // per-interface rows with inline sparklines; overflow scrolls, so
+        // the panel stays compact
+        Constraint::Length(8),
         Constraint::Fill(3),
         Constraint::Length(mem_rows),
     ])

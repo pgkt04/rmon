@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
@@ -65,9 +65,9 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // per-interface rows sit on top; the aggregate graph gets every leftover
-    // row below, mirroring the dsk panel. 2 rows always stay for the graphs
-    let cap = (inner.height.saturating_sub(2)).max(1) as usize;
+    // per-interface rows only; the aggregate story lives in the title, so
+    // each row's own sparkline gets the space instead of a shared graph
+    let cap = (inner.height as usize).max(1);
     app.net_rows_cap = cap;
     app.net_offset = app.net_offset.min(vis.saturating_sub(cap));
     let offset = app.net_offset;
@@ -83,7 +83,6 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // name + rates text, then rx/tx sparklines fill the rest of the row
     const TEXT_W: u16 = 12 + 24 + 2;
-    let used = rows.len().saturating_sub(offset).min(cap) as u16;
     for (n, i) in rows.iter().skip(offset).take(cap).enumerate() {
         let row = Rect::new(inner.x, inner.y + n as u16, inner.width, 1);
         f.render_widget(
@@ -113,22 +112,4 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(track) = super::rows_scrollbar(area, inner.y, cap, rows.len()) {
         super::draw_scrollbar(f, track, rows.len(), offset);
     }
-    let used = used.max(1);
-
-    let graph_area = Rect::new(
-        inner.x,
-        inner.y + used,
-        inner.width,
-        inner.height.saturating_sub(used),
-    );
-    if graph_area.height < 2 {
-        return;
-    }
-    // download stacks over upload at full width; side-by-side halves
-    // read as one confusing band
-    let [rx_area, tx_area] =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .areas(graph_area);
-    graph(f, &app.net_rx, RX, rx_area);
-    graph(f, &app.net_tx, TX, tx_area);
 }

@@ -545,7 +545,10 @@ impl App {
                         &i.name,
                         s.taken,
                         rx_bps > 0.0 || tx_bps > 0.0,
-                        i.rx_bytes + i.tx_bytes > 0,
+                        // every iface starts hidden — even ones with lifetime
+                        // traffic — so startup does not flash the whole list;
+                        // a row earns its spot with a live byte
+                        false,
                     );
                     NetRow {
                         name: i.name.clone(),
@@ -1096,34 +1099,49 @@ mod tests {
         };
         app.on_event(AppEvent::Snapshot(a));
         b.net.interfaces = vec![
-            iface("gif0", 0, 0),           // never active: born hidden
-            iface("en0", 101_000, 50_500), // rate > 0 this tick
-            iface("utun4", 7_000, 3_000),  // lifetime traffic, idle now... rate 0
+            iface("gif0", 0, 0),
+            iface("en0", 101_000, 50_500),
+            iface("utun4", 7_000, 3_000),
         ];
         app.on_event(AppEvent::Snapshot(b));
         // busiest lifetime first: en0, utun4, gif0
         let names: Vec<&str> = app.net_ifaces.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["en0", "utun4", "gif0"]);
-        // en0 active; utun4 first sight with lifetime traffic -> grace; gif0 born idle
-        let vis: Vec<&str> = app.visible_net().iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(vis, ["en0", "utun4"], "gif0 hidden from birth");
+        // first sight shows nothing: a row must earn its spot with a live byte
+        assert!(app.visible_net().is_empty(), "all born hidden at startup");
 
-        // 6 quiet seconds later utun4 exceeds the grace period
+        // en0 moves bytes -> it appears; the quiet ones stay hidden
         let mut c = snap(200, 1000);
-        c.taken = base + Duration::from_secs(7);
+        c.taken = base + Duration::from_secs(2);
         c.net = NetSnapshot {
             rx_bytes: 108_000,
             tx_bytes: 53_500,
             interfaces: vec![
                 iface("gif0", 0, 0),
-                iface("en0", 101_000, 50_500), // now idle too, but only 6s
+                iface("en0", 108_000, 53_500),
                 iface("utun4", 7_000, 3_000),
             ],
             ..Default::default()
         };
         app.on_event(AppEvent::Snapshot(c));
         let vis: Vec<&str> = app.visible_net().iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(vis, Vec::<&str>::new(), "everything idle past grace hides");
+        assert_eq!(vis, ["en0"], "traffic earns the row");
+
+        // 6 quiet seconds later en0 exceeds the grace period and hides again
+        let mut d = snap(250, 1050);
+        d.taken = base + Duration::from_secs(8);
+        d.net = NetSnapshot {
+            rx_bytes: 108_000,
+            tx_bytes: 53_500,
+            interfaces: vec![
+                iface("gif0", 0, 0),
+                iface("en0", 108_000, 53_500),
+                iface("utun4", 7_000, 3_000),
+            ],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Snapshot(d));
+        assert!(app.visible_net().is_empty(), "idle past grace hides");
 
         // h shows them all again
         key(&mut app, KeyCode::Char('h'));
