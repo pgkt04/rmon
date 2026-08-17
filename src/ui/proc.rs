@@ -15,6 +15,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         SortBy::Cpu => "cpu",
         SortBy::Mem => "mem",
         SortBy::Io => "io",
+        SortBy::Name => "name",
     };
     let title = Line::from(vec![
         Span::styled(
@@ -23,7 +24,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(
             format!(
-                "{} procs, sort {sort} [c/m/i] [k]ill [f]ilter ",
+                "{} procs, sort {sort} [c/m/i/n] [k]ill [f]ilter ",
                 app.procs.len()
             ),
             Style::new().fg(theme::LABEL),

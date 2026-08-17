@@ -59,6 +59,7 @@ pub enum SortBy {
     Cpu,
     Mem,
     Io,
+    Name,
 }
 
 /// one row in the bench target prompt
@@ -261,6 +262,11 @@ impl App {
                 self.sort_procs();
                 self.reanchor();
             }
+            KeyCode::Char('n') => {
+                self.sort = SortBy::Name;
+                self.sort_procs();
+                self.reanchor();
+            }
             KeyCode::Char('b') => {
                 let running = self
                     .bench
@@ -443,6 +449,10 @@ impl App {
                 let key = |p: &ProcRow| p.io_bps.unwrap_or(f64::NEG_INFINITY);
                 key(b).total_cmp(&key(a)).then(b.rss.cmp(&a.rss))
             }),
+            // ascending, unlike the load sorts: a name is an identity, not a hotness
+            SortBy::Name => self
+                .procs
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         }
     }
 
@@ -937,6 +947,20 @@ mod tests {
         assert_eq!(app.sort, SortBy::Io);
         assert_eq!(app.procs[0].pid, 1);
         assert_eq!(app.procs[1].pid, 2);
+    }
+
+    #[test]
+    fn sort_by_name_is_case_insensitive_ascending() {
+        let mut app = App {
+            procs: vec![row(1, "Zed"), row(2, "alpha"), row(3, "Beta")],
+            ..App::default()
+        };
+        app.selected_pid = Some(1);
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('n'))));
+        assert_eq!(app.sort, SortBy::Name);
+        let names: Vec<&str> = app.procs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "Beta", "Zed"]);
+        assert_eq!(app.selected, 2, "highlight followed Zed to the bottom");
     }
 
     fn mount(point: &str, available: u64) -> MountInfo {
