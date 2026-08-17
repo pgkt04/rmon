@@ -4,9 +4,10 @@ Terminal system monitor with disk benchmarking.
 
 ![rmon](media/demo.png)
 
-Written in Rust. Panels for cpu (usage, name, temperature, gpu),
-network, disks (per-disk io, mounts, smart health), processes, and
-memory (used, available, swap).
+Written in Rust. Panels for cpu (per-core usage and temperature, even
+across hyperthread siblings), gpu (utilization graph, shown only when
+the host has one), network, disks (per-disk io, mounts, smart health),
+processes, and memory (used, available, swap).
 
 The network panel gives every interface its own row with live rx/tx
 rates and inline history graphs. Interfaces appear when they carry
