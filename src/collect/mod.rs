@@ -46,13 +46,21 @@ pub struct MemSnapshot {
     pub swap_used: u64,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NetSnapshot {
-    /// cumulative bytes, loopback excluded
+/// one physical interface's cumulative traffic; loopback is excluded
+#[derive(Debug, Clone)]
+pub struct NetIface {
+    pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
-    /// busiest non-loopback interface by cumulative traffic
-    pub iface: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetSnapshot {
+    /// aggregate cumulative bytes over all physical interfaces
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// one entry per physical interface, in discovery order
+    pub interfaces: Vec<NetIface>,
 }
 
 #[derive(Debug, Clone)]

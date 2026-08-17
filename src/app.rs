@@ -59,6 +59,14 @@ pub struct DiskRow {
     pub lat_ms: Option<f64>,
 }
 
+/// one physical interface with its live rx/tx rates
+#[derive(Debug, Clone)]
+pub struct NetRow {
+    pub name: String,
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortBy {
     #[default]
@@ -140,7 +148,7 @@ pub struct App {
     pub gpu_util_pct: Option<f64>,
     pub load_avg: Option<[f64; 3]>,
     pub uptime_secs: Option<u64>,
-    pub net_iface: Option<String>,
+    pub net_ifaces: Vec<NetRow>,
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     prev: Option<Snapshot>,
@@ -460,6 +468,30 @@ impl App {
                 s.net.tx_bytes.saturating_sub(prev.net.tx_bytes) as f64 / dt,
             );
 
+            let prev_ifaces: HashMap<&str, &crate::collect::NetIface> = prev
+                .net
+                .interfaces
+                .iter()
+                .map(|i| (i.name.as_str(), i))
+                .collect();
+            self.net_ifaces = s
+                .net
+                .interfaces
+                .iter()
+                .map(|i| {
+                    let p = prev_ifaces.get(i.name.as_str());
+                    NetRow {
+                        name: i.name.clone(),
+                        rx_bps: p
+                            .map(|q| i.rx_bytes.saturating_sub(q.rx_bytes) as f64 / dt)
+                            .unwrap_or(0.0),
+                        tx_bps: p
+                            .map(|q| i.tx_bytes.saturating_sub(q.tx_bytes) as f64 / dt)
+                            .unwrap_or(0.0),
+                    }
+                })
+                .collect();
+
             let prev_by_pid: HashMap<i32, &crate::collect::ProcessInfo> =
                 prev.procs.iter().map(|p| (p.pid, p)).collect();
             self.procs_all = s
@@ -591,7 +623,6 @@ impl App {
         self.gpu_util_pct = s.gpu_util_pct;
         self.load_avg = s.load_avg;
         self.uptime_secs = s.uptime_secs;
-        self.net_iface = s.net.iface.clone();
         self.net_rx_total = s.net.rx_bytes;
         self.net_tx_total = s.net.tx_bytes;
         self.status = None;
@@ -768,7 +799,11 @@ mod tests {
         a.net = NetSnapshot {
             rx_bytes: 1_000,
             tx_bytes: 500,
-            iface: Some("eth0".into()),
+            interfaces: vec![crate::collect::NetIface {
+                name: "eth0".into(),
+                rx_bytes: 1_000,
+                tx_bytes: 500,
+            }],
         };
         a.procs = vec![ProcessInfo {
             pid: 1,
@@ -785,7 +820,11 @@ mod tests {
         b.net = NetSnapshot {
             rx_bytes: 101_000,
             tx_bytes: 50_500,
-            iface: Some("eth0".into()),
+            interfaces: vec![crate::collect::NetIface {
+                name: "eth0".into(),
+                rx_bytes: 101_000,
+                tx_bytes: 50_500,
+            }],
         };
         b.procs = vec![
             ProcessInfo {
@@ -938,6 +977,11 @@ mod tests {
         // 100_000 rx and 50_000 tx bytes over 1s
         assert!((app.net_rx[0] - 100_000.0).abs() < 1_000.0);
         assert!((app.net_tx[0] - 50_000.0).abs() < 500.0);
+        // the per-interface row mirrors the aggregate for the single iface
+        assert_eq!(app.net_ifaces.len(), 1);
+        assert_eq!(app.net_ifaces[0].name, "eth0");
+        assert!((app.net_ifaces[0].rx_bps - 100_000.0).abs() < 1_000.0);
+        assert!((app.net_ifaces[0].tx_bps - 50_000.0).abs() < 500.0);
     }
 
     #[test]

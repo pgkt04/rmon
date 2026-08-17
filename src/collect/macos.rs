@@ -1,5 +1,5 @@
 use super::{
-    CollectError, Collector, CpuSnapshot, CpuTimes, MemSnapshot, MountInfo, NetSnapshot,
+    CollectError, Collector, CpuSnapshot, CpuTimes, MemSnapshot, MountInfo, NetIface, NetSnapshot,
     ProcessInfo, Snapshot, ThreadInfo,
 };
 use libc::{
@@ -487,7 +487,6 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
     }
 
     let mut net = NetSnapshot::default();
-    let mut best: (u64, u16) = (0, 0); // (traffic, ifm_index)
     let mut off = 0usize;
     while off + size_of::<IfMsghdr2Prefix>() <= len {
         // SAFETY: bounds-checked above; the routing message stream is packed,
@@ -507,27 +506,34 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
                 )
             };
             if d.ifi_type != IFT_LOOP {
-                net.rx_bytes += d.ifi_ibytes;
-                net.tx_bytes += d.ifi_obytes;
-                let traffic = d.ifi_ibytes + d.ifi_obytes;
-                if traffic > best.0 {
-                    best = (traffic, hdr.ifm_index);
-                }
+                let iface = NetIface {
+                    name: ifname(hdr.ifm_index),
+                    rx_bytes: d.ifi_ibytes,
+                    tx_bytes: d.ifi_obytes,
+                };
+                net.rx_bytes += iface.rx_bytes;
+                net.tx_bytes += iface.tx_bytes;
+                net.interfaces.push(iface);
             }
         }
         off += hdr.ifm_msglen as usize;
     }
-    if best.0 > 0 {
-        let mut name = [0u8; libc::IF_NAMESIZE];
-        // SAFETY: buffer is IF_NAMESIZE bytes as the contract requires
-        let p = unsafe { libc::if_indextoname(best.1.into(), name.as_mut_ptr().cast()) };
-        if !p.is_null() {
-            // SAFETY: if_indextoname NUL-terminates on success
-            let s = unsafe { std::ffi::CStr::from_ptr(name.as_ptr().cast()) };
-            net.iface = s.to_str().ok().map(str::to_owned);
-        }
-    }
     Ok(net)
+}
+
+/// interface index to a name; falls back to the index when the name is unreadable
+fn ifname(index: u16) -> String {
+    let mut name = [0u8; libc::IF_NAMESIZE];
+    // SAFETY: buffer is IF_NAMESIZE bytes as the contract requires
+    let p = unsafe { libc::if_indextoname(index.into(), name.as_mut_ptr().cast()) };
+    if p.is_null() {
+        return format!("if{index}");
+    }
+    // SAFETY: if_indextoname NUL-terminates on success
+    let s = unsafe { std::ffi::CStr::from_ptr(name.as_ptr().cast()) };
+    s.to_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|_| format!("if{index}"))
 }
 
 /// kern.proc.all sweep: one kinfo_proc per process, root-owned included, no

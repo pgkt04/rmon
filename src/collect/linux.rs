@@ -1,6 +1,6 @@
 use super::{
-    CollectError, CpuSnapshot, CpuTimes, DiskStats, MemSnapshot, NetSnapshot, ProcessInfo,
-    ThreadInfo,
+    CollectError, CpuSnapshot, CpuTimes, DiskStats, MemSnapshot, NetIface, NetSnapshot,
+    ProcessInfo, ThreadInfo,
 };
 #[cfg(target_os = "linux")]
 use super::{Collector, MountInfo, Snapshot};
@@ -80,7 +80,6 @@ pub fn parse_meminfo(s: &str) -> Result<MemSnapshot, CollectError> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn parse_net_dev(s: &str) -> NetSnapshot {
     let mut net = NetSnapshot::default();
-    let mut best = 0u64;
     for line in s.lines().skip(2) {
         let Some((name, rest)) = line.split_once(':') else {
             continue;
@@ -93,12 +92,14 @@ pub fn parse_net_dev(s: &str) -> NetSnapshot {
             .map(|x| x.parse().unwrap_or(0))
             .collect();
         if f.len() >= 9 {
-            net.rx_bytes += f[0];
-            net.tx_bytes += f[8];
-            if f[0] + f[8] > best {
-                best = f[0] + f[8];
-                net.iface = Some(name.trim().to_owned());
-            }
+            let iface = NetIface {
+                name: name.trim().to_owned(),
+                rx_bytes: f[0],
+                tx_bytes: f[8],
+            };
+            net.rx_bytes += iface.rx_bytes;
+            net.tx_bytes += iface.tx_bytes;
+            net.interfaces.push(iface);
         }
     }
     net
@@ -580,8 +581,14 @@ mod tests {
         let net = parse_net_dev(NET_DEV);
         assert_eq!(net.rx_bytes, 1_000_000 + 250_000);
         assert_eq!(net.tx_bytes, 500_000 + 125_000);
-        // eth0 carries the most traffic in the fixture
-        assert_eq!(net.iface.as_deref(), Some("eth0"));
+        // loopback is dropped; the physical interfaces are listed individually
+        assert_eq!(
+            net.interfaces
+                .iter()
+                .map(|i| (i.name.as_str(), i.rx_bytes, i.tx_bytes))
+                .collect::<Vec<_>>(),
+            vec![("eth0", 1_000_000, 500_000), ("wlan0", 250_000, 125_000)]
+        );
     }
 
     #[test]

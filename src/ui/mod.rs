@@ -41,7 +41,9 @@ fn panels(area: Rect, app: &App) -> [Rect; 5] {
         // a 0-100 scaled graph in a huge box is mostly blank at idle; keep
         // the cpu box short and dense
         Constraint::Percentage(30),
-        Constraint::Length(8),
+        // per-interface rows on top, aggregate graph below; tall enough for
+        // a couple interfaces plus a graph on typical terminals
+        Constraint::Length(12),
         Constraint::Fill(3),
         Constraint::Length(mem_rows),
     ])
@@ -240,7 +242,18 @@ mod tests {
         app.gpu_name = Some("Apple M1 Pro".into());
         app.gpu_util_pct = Some(22.0);
         app.core_temps_c = vec![41.0, 43.5, 44.0, 42.2, 40.9, 39.0, 38.5, 38.0, 37.7, 37.2];
-        app.net_iface = Some("en0".into());
+        app.net_ifaces = vec![
+            crate::app::NetRow {
+                name: "en0".into(),
+                rx_bps: (1 << 20) as f64,
+                tx_bps: (400 << 10) as f64,
+            },
+            crate::app::NetRow {
+                name: "utun3".into(),
+                rx_bps: (8 << 10) as f64,
+                tx_bps: (2 << 10) as f64,
+            },
+        ];
         app.net_rx_total = 12 << 30;
         app.net_tx_total = 800 << 20;
         app.load_avg = Some([2.14, 1.82, 1.53]);
