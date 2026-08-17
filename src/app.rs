@@ -92,7 +92,10 @@ pub struct App {
     pub mem: MemSnapshot,
     pub net_rx: VecDeque<f64>,
     pub net_tx: VecDeque<f64>,
+    /// what the proc panel shows: procs_all narrowed by the filter
     pub procs: Vec<ProcRow>,
+    /// every process from the last snapshot; filter edits re-derive procs
+    procs_all: Vec<ProcRow>,
     pub disk_io: VecDeque<f64>,
     pub disks: Vec<DiskRow>,
     pub mounts: Vec<MountInfo>,
@@ -109,6 +112,10 @@ pub struct App {
     pub bench_target: Option<std::path::PathBuf>,
     pub picker: Option<BenchPicker>,
     pub confirm_kill: Option<KillPrompt>,
+    /// live substring filter for the proc list; empty = off
+    pub filter: String,
+    /// true while `f` captures keystrokes into the filter
+    pub filter_edit: bool,
     pub smart: Vec<SmartInfo>,
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
@@ -202,8 +209,39 @@ impl App {
             }
             return;
         }
+        // filter input captures text; enter keeps the filter, esc drops it
+        if self.filter_edit {
+            match k.code {
+                KeyCode::Enter => self.filter_edit = false,
+                KeyCode::Esc => {
+                    self.filter_edit = false;
+                    self.filter.clear();
+                    self.refilter();
+                }
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.refilter();
+                }
+                KeyCode::Char(c) => {
+                    self.filter.push(c);
+                    self.refilter();
+                }
+                _ => {}
+            }
+            return;
+        }
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            // esc peels the filter first; a second esc quits
+            KeyCode::Esc => {
+                if self.filter.is_empty() {
+                    self.quit = true;
+                } else {
+                    self.filter.clear();
+                    self.refilter();
+                }
+            }
+            KeyCode::Char('f') | KeyCode::Char('/') => self.filter_edit = true,
             KeyCode::Up => self.select(self.selected.saturating_sub(1)),
             KeyCode::Down => {
                 self.select((self.selected + 1).min(self.procs.len().saturating_sub(1)));
@@ -302,7 +340,7 @@ impl App {
 
             let prev_by_pid: HashMap<i32, &crate::collect::ProcessInfo> =
                 prev.procs.iter().map(|p| (p.pid, p)).collect();
-            self.procs = s
+            self.procs_all = s
                 .procs
                 .iter()
                 .map(|p| {
@@ -377,8 +415,7 @@ impl App {
                 })
                 .collect();
             push_capped(&mut self.disk_io, total_bps);
-            self.sort_procs();
-            self.reanchor();
+            self.refilter();
         }
         self.mem = s.mem;
         self.mounts = s.mounts.clone();
@@ -407,6 +444,26 @@ impl App {
                 key(b).total_cmp(&key(a)).then(b.rss.cmp(&a.rss))
             }),
         }
+    }
+
+    /// re-derive the visible list from procs_all, then sort and reanchor.
+    /// matches on a case-insensitive name substring, or on the pid digits
+    fn refilter(&mut self) {
+        if self.filter.is_empty() {
+            self.procs = self.procs_all.clone();
+        } else {
+            let needle = self.filter.to_lowercase();
+            self.procs = self
+                .procs_all
+                .iter()
+                .filter(|p| {
+                    p.name.to_lowercase().contains(&needle) || p.pid.to_string().contains(&needle)
+                })
+                .cloned()
+                .collect();
+        }
+        self.sort_procs();
+        self.reanchor();
     }
 
     /// move the highlight and remember which process sits under it
@@ -707,6 +764,96 @@ mod tests {
         }];
         app.on_event(AppEvent::Snapshot(d));
         assert_eq!((app.selected, app.selected_pid), (0, Some(1)));
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_event(AppEvent::Key(KeyEvent::from(code)));
+    }
+
+    #[test]
+    fn filter_narrows_live_and_survives_snapshots() {
+        let mut app = App::default();
+        let (a, b) = pair();
+        let base = a.taken;
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        assert_eq!(app.procs.len(), 2);
+
+        // type a case-insensitive needle; the list narrows on every keystroke
+        key(&mut app, KeyCode::Char('f'));
+        assert!(app.filter_edit);
+        for c in "BET".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.procs.len(), 1);
+        assert_eq!(app.procs[0].name, "beta");
+        assert_eq!(app.selected_pid, Some(2), "selection adopted the match");
+
+        // enter commits; the next snapshot must not resurrect hidden rows
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.filter_edit);
+        let mut c = snap(200, 1000);
+        c.taken = base + Duration::from_secs(2);
+        c.procs = vec![
+            ProcessInfo {
+                pid: 1,
+                name: "alpha".into(),
+                cpu_ns: 600_000_000,
+                rss: 100,
+                disk_read: Some(3 << 20),
+                disk_written: Some(1 << 20),
+            },
+            ProcessInfo {
+                pid: 2,
+                name: "beta".into(),
+                cpu_ns: 10_999,
+                rss: 9_000,
+                disk_read: None,
+                disk_written: None,
+            },
+        ];
+        app.on_event(AppEvent::Snapshot(c));
+        assert_eq!(app.procs.len(), 1);
+        assert_eq!(app.procs[0].name, "beta");
+    }
+
+    #[test]
+    fn filter_edit_swallows_keys_and_esc_peels() {
+        let mut app = App::default();
+        let (a, b) = pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+
+        // q and k are text while editing, not quit / kill
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Char('q'));
+        key(&mut app, KeyCode::Char('k'));
+        assert!(!app.quit);
+        assert!(app.confirm_kill.is_none());
+        assert_eq!(app.filter, "qk");
+        assert!(app.procs.is_empty(), "no proc matches qk");
+
+        // backspace repairs the needle; pid digits match too
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.procs.len(), 1);
+        assert_eq!(app.procs[0].pid, 2);
+
+        // esc while editing drops the filter entirely
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.filter_edit && app.filter.is_empty());
+        assert_eq!(app.procs.len(), 2);
+
+        // committed filter: first esc peels it, second esc quits
+        key(&mut app, KeyCode::Char('/'));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.quit);
+        assert!(app.filter.is_empty());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.quit);
     }
 
     #[test]

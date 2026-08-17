@@ -22,14 +22,25 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(theme::TITLE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{} procs, sort {sort} [c/m/i] [k]ill ", app.procs.len()),
+            format!(
+                "{} procs, sort {sort} [c/m/i] [k]ill [f]ilter ",
+                app.procs.len()
+            ),
             Style::new().fg(theme::LABEL),
         ),
     ]);
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::BORDER))
         .title(title);
+    // filter readout on the bottom border; a block cursor marks live input
+    if app.filter_edit || !app.filter.is_empty() {
+        let cursor = if app.filter_edit { "█" } else { "" };
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" filter: {}{cursor} ", app.filter),
+            Style::new().fg(theme::TITLE).add_modifier(Modifier::BOLD),
+        )));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 2 {
