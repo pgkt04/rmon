@@ -200,7 +200,8 @@ mod tests {
                 rss: 1 << 30,
                 io_bps: Some(2.0 * 1024.0 * 1024.0),
                 tid: None,
-                last_child: false,
+                ppid: 0,
+                prefix: String::new(),
             },
             ProcRow {
                 pid: 777,
@@ -209,7 +210,8 @@ mod tests {
                 rss: 8 << 20,
                 io_bps: None,
                 tid: None,
-                last_child: false,
+                ppid: 0,
+                prefix: String::new(),
             },
         ];
         app.disk_io = (0..60).map(|i| (i % 8) as f64 * 3_000_000.0).collect();
@@ -385,7 +387,8 @@ mod tests {
                 rss: 0,
                 io_bps: None,
                 tid: None,
-                last_child: false,
+                ppid: 0,
+                prefix: String::new(),
             })
             .collect();
         app
@@ -627,7 +630,8 @@ mod tests {
                 rss: 0,
                 io_bps: None,
                 tid: None,
-                last_child: false,
+                ppid: 0,
+                prefix: String::new(),
             })
             .collect();
         term.draw(|f| draw(f, &mut app)).unwrap();

@@ -89,6 +89,8 @@ pub struct ThreadInfo {
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: i32,
+    /// parent pid; 0 = unknown/no parent
+    pub ppid: i32,
     pub name: String,
     /// cumulative cpu time in ns (user + system)
     pub cpu_ns: u64,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 
@@ -35,6 +35,8 @@ pub struct BenchState {
 #[derive(Debug, Clone)]
 pub struct ProcRow {
     pub pid: i32,
+    /// parent pid, 0 = none/unknown; thread rows carry their owner's pid
+    pub ppid: i32,
     pub name: String,
     /// 100.0 = one full core
     pub cpu_pct: f64,
@@ -42,8 +44,8 @@ pub struct ProcRow {
     pub io_bps: Option<f64>,
     /// Some = this row is a thread of `pid`, not a process
     pub tid: Option<u64>,
-    /// last thread under its parent; picks the └─ glyph
-    pub last_child: bool,
+    /// pre-rendered tree rail ("├─ ", "│  └─ ", ...); empty for flat proc rows
+    pub prefix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +127,8 @@ pub struct App {
     pub filter_edit: bool,
     /// `t`: interleave thread rows under their processes
     pub show_threads: bool,
+    /// `e`: arrange procs as a ppid tree, btop style
+    pub tree: bool,
     /// thread rows keyed by owning pid, rebuilt every snapshot; refilter
     /// weaves them into `procs` when show_threads is on
     threads_by_pid: HashMap<i32, Vec<ProcRow>>,
@@ -146,6 +150,92 @@ fn push_capped(hist: &mut VecDeque<f64>, v: f64) {
     hist.push_back(v);
     if hist.len() > HISTORY {
         hist.pop_front();
+    }
+}
+
+/// one comparator shared by flat and tree mode so sibling order matches the list
+fn cmp_rows(sort: SortBy, a: &ProcRow, b: &ProcRow) -> std::cmp::Ordering {
+    match sort {
+        SortBy::Cpu => b.cpu_pct.total_cmp(&a.cpu_pct).then(b.rss.cmp(&a.rss)),
+        SortBy::Mem => b.rss.cmp(&a.rss),
+        SortBy::Io => {
+            let key = |p: &ProcRow| p.io_bps.unwrap_or(f64::NEG_INFINITY);
+            key(b).total_cmp(&key(a)).then(b.rss.cmp(&a.rss))
+        }
+        // ascending, unlike the load sorts: a name is an identity, not a hotness
+        SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    }
+}
+
+/// threads only sort within their process; the tid tie-break keeps
+/// equal threads from shuffling every tick
+fn sort_threads(sort: SortBy, ts: &mut [ProcRow]) {
+    match sort {
+        SortBy::Name => {
+            ts.sort_by(|a, b| (a.name.to_lowercase(), a.tid).cmp(&(b.name.to_lowercase(), b.tid)))
+        }
+        _ => ts.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(a.tid.cmp(&b.tid))),
+    }
+}
+
+/// DFS state for the ppid tree flatten; procs come in comparator-sorted,
+/// so index order is sibling order everywhere
+struct TreeWalk<'a> {
+    procs: &'a [ProcRow],
+    children: &'a HashMap<i32, Vec<usize>>,
+    threads: &'a HashMap<i32, Vec<ProcRow>>,
+    show_threads: bool,
+    sort: SortBy,
+    seen: HashSet<i32>,
+    out: Vec<ProcRow>,
+}
+
+impl TreeWalk<'_> {
+    /// emit idx with its rail+glyph, then its threads, then its child procs.
+    /// the seen set breaks ppid cycles: a revisited pid is skipped
+    fn walk(&mut self, idx: usize, rail: &str, glyph: &str) {
+        let p = &self.procs[idx];
+        if !self.seen.insert(p.pid) {
+            return;
+        }
+        let mut row = p.clone();
+        row.prefix = format!("{rail}{glyph}");
+        self.out.push(row);
+        // what the kids see: │ keeps the rail alive past a ├─, blanks past a └─
+        let rail = match glyph {
+            "" => rail.to_string(),
+            "├─ " => format!("{rail}│  "),
+            _ => format!("{rail}   "),
+        };
+        let pid = self.procs[idx].pid;
+        // already-seen kids are cycle re-entries; drop them before picking └─
+        let kids: Vec<usize> = self.children.get(&pid).map_or_else(Vec::new, |v| {
+            v.iter()
+                .copied()
+                .filter(|&c| !self.seen.contains(&self.procs[c].pid))
+                .collect()
+        });
+        let mut ts = if self.show_threads {
+            self.threads.get(&pid).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        sort_threads(self.sort, &mut ts);
+        let n_threads = ts.len();
+        let total = n_threads + kids.len();
+        // threads first, one level deeper, then the child processes
+        for (j, mut t) in ts.into_iter().enumerate() {
+            t.prefix = format!("{rail}{}", if j + 1 == total { "└─ " } else { "├─ " });
+            self.out.push(t);
+        }
+        for (j, &k) in kids.iter().enumerate() {
+            let glyph = if n_threads + j + 1 == total {
+                "└─ "
+            } else {
+                "├─ "
+            };
+            self.walk(k, &rail, glyph);
+        }
     }
 }
 
@@ -282,6 +372,10 @@ impl App {
                 self.show_threads = !self.show_threads;
                 self.refilter();
             }
+            KeyCode::Char('e') => {
+                self.tree = !self.tree;
+                self.refilter();
+            }
             KeyCode::Char('b') => {
                 let running = self
                     .bench
@@ -375,6 +469,7 @@ impl App {
                     let prev_p = prev_by_pid.get(&p.pid);
                     ProcRow {
                         pid: p.pid,
+                        ppid: p.ppid,
                         name: p.name.clone(),
                         // a pid unseen last tick gets 0 rather than its lifetime total
                         cpu_pct: prev_p
@@ -390,7 +485,7 @@ impl App {
                             }
                         }),
                         tid: None,
-                        last_child: false,
+                        prefix: String::new(),
                     }
                 })
                 .collect();
@@ -413,6 +508,8 @@ impl App {
                         .iter()
                         .map(|t| ProcRow {
                             pid: p.pid,
+                            // a thread belongs to its process, tree-wise
+                            ppid: p.pid,
                             // unnamed threads still need a label
                             name: if t.name.is_empty() {
                                 format!("tid {}", t.tid)
@@ -426,7 +523,7 @@ impl App {
                             rss: 0,
                             io_bps: None,
                             tid: Some(t.tid),
-                            last_child: false,
+                            prefix: String::new(),
                         })
                         .collect();
                     self.threads_by_pid.insert(p.pid, rows);
@@ -505,19 +602,12 @@ impl App {
         // thread rows ride under their parent, never sort against processes:
         // strip them, sort the processes, weave the threads back in
         self.procs.retain(|p| p.tid.is_none());
-        match self.sort {
-            SortBy::Cpu => self
-                .procs
-                .sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(b.rss.cmp(&a.rss))),
-            SortBy::Mem => self.procs.sort_by_key(|p| std::cmp::Reverse(p.rss)),
-            SortBy::Io => self.procs.sort_by(|a, b| {
-                let key = |p: &ProcRow| p.io_bps.unwrap_or(f64::NEG_INFINITY);
-                key(b).total_cmp(&key(a)).then(b.rss.cmp(&a.rss))
-            }),
-            // ascending, unlike the load sorts: a name is an identity, not a hotness
-            SortBy::Name => self
-                .procs
-                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        let sort = self.sort;
+        self.procs.sort_by(|a, b| cmp_rows(sort, a, b));
+        // a live filter punches holes in the hierarchy; stay flat until it clears
+        if self.tree && self.filter.is_empty() {
+            self.build_tree();
+            return;
         }
         if !self.show_threads {
             return;
@@ -531,19 +621,56 @@ impl App {
                 continue;
             };
             let mut ts = ts.clone();
-            match self.sort {
-                // tid tie-break keeps equal threads from shuffling every tick
-                SortBy::Name => ts.sort_by(|a, b| {
-                    (a.name.to_lowercase(), a.tid).cmp(&(b.name.to_lowercase(), b.tid))
-                }),
-                _ => ts.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(a.tid.cmp(&b.tid))),
-            }
-            if let Some(last) = ts.last_mut() {
-                last.last_child = true;
+            sort_threads(sort, &mut ts);
+            // flat mode still rails the threads; the last one closes the box
+            let n = ts.len();
+            for (i, t) in ts.iter_mut().enumerate() {
+                t.prefix = if i + 1 == n {
+                    "└─ ".into()
+                } else {
+                    "├─ ".into()
+                };
             }
             out.extend(ts);
         }
         self.procs = out;
+    }
+
+    /// ppid hierarchy flattened depth-first. roots: no parent, parent gone,
+    /// or parent == self. cycle members never reach a root, so whatever the
+    /// DFS missed gets swept in afterwards as extra roots — nothing vanishes
+    fn build_tree(&mut self) {
+        let procs = std::mem::take(&mut self.procs);
+        let pids: HashSet<i32> = procs.iter().map(|p| p.pid).collect();
+        let mut children: HashMap<i32, Vec<usize>> = HashMap::new();
+        let mut roots = Vec::new();
+        for (i, p) in procs.iter().enumerate() {
+            if p.ppid <= 0 || p.ppid == p.pid || !pids.contains(&p.ppid) {
+                roots.push(i);
+            } else {
+                children.entry(p.ppid).or_default().push(i);
+            }
+        }
+        let mut w = TreeWalk {
+            procs: &procs,
+            children: &children,
+            threads: &self.threads_by_pid,
+            show_threads: self.show_threads,
+            sort: self.sort,
+            seen: HashSet::with_capacity(procs.len()),
+            out: Vec::with_capacity(procs.len()),
+        };
+        for &r in &roots {
+            w.walk(r, "", "");
+        }
+        // cycle members unreachable from any root; sweep them in as roots.
+        // check seen fresh each step: one walk can absorb later stragglers
+        for (i, p) in procs.iter().enumerate() {
+            if !w.seen.contains(&p.pid) {
+                w.walk(i, "", "");
+            }
+        }
+        self.procs = w.out;
     }
 
     /// re-derive the visible list from procs_all, then sort and reanchor.
@@ -599,7 +726,13 @@ impl App {
             .selected_id
             .and_then(|(pid, tid)| self.procs.iter().position(|p| p.pid == pid && p.tid == tid))
         {
-            Some(idx) => self.selected = idx,
+            Some(idx) => {
+                // shift the viewport with the row so it stays glued to the
+                // same screen line; the list slides underneath instead
+                let delta = idx as isize - self.selected as isize;
+                self.view_offset = (self.view_offset as isize + delta).max(0) as usize;
+                self.selected = idx;
+            }
             None => {
                 self.selected = self.selected.min(self.procs.len().saturating_sub(1));
                 self.selected_id = self.procs.get(self.selected).map(|p| (p.pid, p.tid));
@@ -639,6 +772,7 @@ mod tests {
         };
         a.procs = vec![ProcessInfo {
             pid: 1,
+            ppid: 0,
             name: "alpha".into(),
             cpu_ns: 0,
             rss: 100,
@@ -656,6 +790,7 @@ mod tests {
         b.procs = vec![
             ProcessInfo {
                 pid: 1,
+                ppid: 0,
                 name: "alpha".into(),
                 cpu_ns: 500_000_000,
                 rss: 100,
@@ -665,6 +800,7 @@ mod tests {
             },
             ProcessInfo {
                 pid: 2,
+                ppid: 0,
                 name: "beta".into(),
                 cpu_ns: 9_999,
                 rss: 9_000,
@@ -699,12 +835,13 @@ mod tests {
     fn row(pid: i32, name: &str) -> ProcRow {
         ProcRow {
             pid,
+            ppid: 0,
             name: name.into(),
             cpu_pct: 0.0,
             rss: 0,
             io_bps: None,
             tid: None,
-            last_child: false,
+            prefix: String::new(),
         }
     }
 
@@ -850,6 +987,7 @@ mod tests {
         c.procs = vec![
             ProcessInfo {
                 pid: 1,
+                ppid: 0,
                 name: "alpha".into(),
                 cpu_ns: 500_000_000, // unchanged since b -> 0%
                 rss: 100,
@@ -859,6 +997,7 @@ mod tests {
             },
             ProcessInfo {
                 pid: 2,
+                ppid: 0,
                 name: "beta".into(),
                 cpu_ns: 800_009_999,
                 rss: 9_000,
@@ -877,6 +1016,7 @@ mod tests {
         d.taken = base + Duration::from_secs(3);
         d.procs = vec![ProcessInfo {
             pid: 1,
+            ppid: 0,
             name: "alpha".into(),
             cpu_ns: 500_000_000,
             rss: 100,
@@ -923,6 +1063,7 @@ mod tests {
         c.procs = vec![
             ProcessInfo {
                 pid: 1,
+                ppid: 0,
                 name: "alpha".into(),
                 cpu_ns: 600_000_000,
                 rss: 100,
@@ -932,6 +1073,7 @@ mod tests {
             },
             ProcessInfo {
                 pid: 2,
+                ppid: 0,
                 name: "beta".into(),
                 cpu_ns: 10_999,
                 rss: 9_000,
@@ -1242,6 +1384,7 @@ mod tests {
     fn tproc(pid: i32, name: &str, cpu_ns: u64, rss: u64, threads: Vec<ThreadInfo>) -> ProcessInfo {
         ProcessInfo {
             pid,
+            ppid: 0,
             name: name.into(),
             cpu_ns,
             rss,
@@ -1304,8 +1447,7 @@ mod tests {
         // threads cpu-desc under alpha: worker (30%) before the unnamed one (10%)
         assert_eq!(ids, [(1, None), (1, Some(10)), (1, Some(11)), (2, None)]);
         assert_eq!(app.procs[2].name, "tid 11", "unnamed thread gets a label");
-        let last: Vec<bool> = app.procs.iter().map(|p| p.last_child).collect();
-        assert_eq!(last, [false, false, true, false]);
+        assert_eq!(prefixes(&app), ["", "├─ ", "└─ ", ""]);
         assert_eq!(app.procs[1].rss, 0);
         assert!(app.procs[1].io_bps.is_none());
 
@@ -1313,7 +1455,7 @@ mod tests {
         key(&mut app, KeyCode::Char('n'));
         let names: Vec<&str> = app.procs.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["alpha", "tid 11", "worker", "beta"]);
-        assert!(app.procs[2].last_child);
+        assert_eq!(app.procs[2].prefix, "└─ ");
 
         key(&mut app, KeyCode::Char('t'));
         assert_eq!(app.procs.len(), 2, "second t collapses");
@@ -1435,6 +1577,218 @@ mod tests {
         assert_eq!(app.filter, "t");
     }
 
+    fn pproc(pid: i32, ppid: i32, name: &str, cpu_ns: u64) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid,
+            name: name.into(),
+            cpu_ns,
+            rss: 0,
+            disk_read: None,
+            disk_written: None,
+            threads: Vec::new(),
+        }
+    }
+
+    // 1s apart; cpu desc: 1 (40%) > 3 (30%) > 2 (20%) > 4 (10%).
+    // hierarchy: 1 -> {2, 3}, 3 -> {4}
+    fn tree_pair() -> (Box<Snapshot>, Box<Snapshot>) {
+        let base = Instant::now();
+        let mut a = snap(100, 900);
+        a.taken = base;
+        a.procs = vec![
+            pproc(1, 0, "one", 0),
+            pproc(2, 1, "two", 0),
+            pproc(3, 1, "three", 0),
+            pproc(4, 3, "four", 0),
+        ];
+        let mut b = snap(150, 950);
+        b.taken = base + Duration::from_secs(1);
+        b.procs = vec![
+            pproc(1, 0, "one", 400_000_000),
+            pproc(2, 1, "two", 200_000_000),
+            pproc(3, 1, "three", 300_000_000),
+            pproc(4, 3, "four", 100_000_000),
+        ];
+        (a, b)
+    }
+
+    fn pids(app: &App) -> Vec<i32> {
+        app.procs.iter().map(|p| p.pid).collect()
+    }
+
+    fn prefixes(app: &App) -> Vec<&str> {
+        app.procs.iter().map(|p| p.prefix.as_str()).collect()
+    }
+
+    #[test]
+    fn e_builds_the_ppid_tree_and_collapses() {
+        let mut app = App::default();
+        let (a, b) = tree_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        assert_eq!(pids(&app), [1, 3, 2, 4], "flat cpu order first");
+
+        key(&mut app, KeyCode::Char('e'));
+        assert!(app.tree);
+        // children of 1 sort by cpu: 3 before 2; 4 hangs off 3
+        assert_eq!(pids(&app), [1, 3, 4, 2]);
+        assert_eq!(prefixes(&app), ["", "├─ ", "│  └─ ", "└─ "]);
+
+        key(&mut app, KeyCode::Char('e'));
+        assert!(!app.tree);
+        assert_eq!(pids(&app), [1, 3, 2, 4], "second e restores flat order");
+        assert!(app.procs.iter().all(|p| p.prefix.is_empty()));
+    }
+
+    #[test]
+    fn orphan_and_self_parent_become_roots() {
+        let mut app = App::default();
+        let base = Instant::now();
+        let mut a = snap(100, 900);
+        a.taken = base;
+        a.procs = vec![pproc(5, 99, "orphan", 0), pproc(7, 7, "selfie", 0)];
+        let mut b = snap(150, 950);
+        b.taken = base + Duration::from_secs(1);
+        b.procs = vec![
+            pproc(5, 99, "orphan", 200_000_000),
+            pproc(7, 7, "selfie", 100_000_000),
+        ];
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(pids(&app), [5, 7], "both are roots, neither loops");
+        assert_eq!(prefixes(&app), ["", ""]);
+    }
+
+    #[test]
+    fn ppid_cycle_terminates_and_surfaces_every_pid() {
+        let mut app = App::default();
+        let base = Instant::now();
+        let mut a = snap(100, 900);
+        a.taken = base;
+        a.procs = vec![
+            pproc(1, 0, "root", 0),
+            pproc(2, 3, "yin", 0),
+            pproc(3, 2, "yang", 0),
+        ];
+        let mut b = snap(150, 950);
+        b.taken = base + Duration::from_secs(1);
+        b.procs = vec![
+            pproc(1, 0, "root", 500_000_000),
+            pproc(2, 3, "yin", 300_000_000),
+            pproc(3, 2, "yang", 200_000_000),
+        ];
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        key(&mut app, KeyCode::Char('e'));
+        // 2 <-> 3 never reach a root; the sweep adopts 2 (higher cpu) as one
+        assert_eq!(pids(&app), [1, 2, 3]);
+        assert_eq!(app.procs.iter().filter(|p| p.pid == 2).count(), 1);
+        assert_eq!(app.procs.iter().filter(|p| p.pid == 3).count(), 1);
+    }
+
+    #[test]
+    fn filter_bypasses_the_tree_and_clearing_restores_it() {
+        let mut app = App::default();
+        let (a, b) = tree_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(pids(&app), [1, 3, 4, 2]);
+
+        // "t" matches two and three: flat filtered list, no rails
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Char('t'));
+        assert_eq!(pids(&app), [3, 2], "flat cpu order within the matches");
+        assert!(app.procs.iter().all(|p| p.prefix.is_empty()));
+        assert!(app.tree, "the toggle survives the filter");
+
+        // esc drops the filter; the tree comes back
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(pids(&app), [1, 3, 4, 2]);
+        assert_eq!(prefixes(&app), ["", "├─ ", "│  └─ ", "└─ "]);
+    }
+
+    #[test]
+    fn tree_threads_hang_under_their_proc_before_child_procs() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Char('e'));
+        let base = Instant::now();
+        // 1 -> {2, 3}, 2 -> {4}; 2 also owns two threads
+        let mut two_a = pproc(2, 1, "two", 0);
+        two_a.threads = vec![tinfo(20, "w", 0), tinfo(21, "x", 0)];
+        let mut a = snap(100, 900);
+        a.taken = base;
+        a.procs = vec![
+            pproc(1, 0, "one", 0),
+            two_a,
+            pproc(3, 1, "three", 0),
+            pproc(4, 2, "four", 0),
+        ];
+        let mut two_b = pproc(2, 1, "two", 400_000_000);
+        two_b.threads = vec![tinfo(20, "w", 300_000_000), tinfo(21, "x", 100_000_000)];
+        let mut b = snap(150, 950);
+        b.taken = base + Duration::from_secs(1);
+        b.procs = vec![
+            pproc(1, 0, "one", 500_000_000),
+            two_b,
+            pproc(3, 1, "three", 300_000_000),
+            pproc(4, 2, "four", 200_000_000),
+        ];
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
+        // threads of 2 come first (cpu desc), then its child proc 4
+        assert_eq!(
+            ids,
+            [
+                (1, None),
+                (2, None),
+                (2, Some(20)),
+                (2, Some(21)),
+                (4, None),
+                (3, None)
+            ]
+        );
+        // 2 has a sibling below (3), so its subtree keeps the │ rail
+        assert_eq!(
+            prefixes(&app),
+            ["", "├─ ", "│  ├─ ", "│  ├─ ", "│  └─ ", "└─ "]
+        );
+    }
+
+    #[test]
+    fn selection_on_a_deep_child_survives_e_toggles() {
+        let mut app = App::default();
+        let (a, b) = tree_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        key(&mut app, KeyCode::Char('e'));
+        // [1, 3, 4, 2]: land on 4, the grandchild
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_id, Some((4, None)));
+
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.selected_id, Some((4, None)));
+        assert_eq!(app.selected, 3, "4 is last in flat cpu order");
+
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.selected_id, Some((4, None)));
+        assert_eq!(app.selected, 2, "back to its tree slot");
+    }
+
+    #[test]
+    fn e_while_filter_editing_is_text_not_a_toggle() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Char('e'));
+        assert!(!app.tree);
+        assert_eq!(app.filter, "e");
+    }
+
     #[test]
     fn viewport_follows_selection_only_off_window() {
         let mut app = App {
@@ -1455,5 +1809,32 @@ mod tests {
         app.procs.truncate(3);
         app.selected = 2;
         assert_eq!(app.scroll_viewport(20), 2);
+    }
+
+    #[test]
+    fn anchored_row_stays_on_its_screen_line_across_resorts() {
+        let mut app = App {
+            procs: (0..50).map(|i| row(i, "p")).collect(),
+            ..App::default()
+        };
+        // user scrolled to a window starting at 10 and picked row 15:
+        // screen line = 15 - 10 = 5
+        app.view_offset = 10;
+        app.select(15);
+        // a resort pushes pid 15 down to index 30
+        let mut moved = app.procs.clone();
+        moved.swap(15, 30);
+        app.procs = moved;
+        app.reanchor();
+        assert_eq!(app.selected, 30);
+        assert_eq!(app.view_offset, 25, "same screen line: 30 - 25 == 5");
+        assert_eq!(app.scroll_viewport(20), 25, "no extra follow-scroll");
+        // and back up, clamped at the top of the list
+        let mut moved = app.procs.clone();
+        moved.swap(30, 2);
+        app.procs = moved;
+        app.reanchor();
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.view_offset, 0, "cannot scroll above the first row");
     }
 }

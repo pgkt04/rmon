@@ -113,12 +113,14 @@ pub fn parse_pid_stat(pid: i32, s: &str, clk_tck: u64, page_size: u64) -> Option
     let close = s.rfind(')')?;
     let name = s.get(open + 1..close)?.to_string();
     let rest: Vec<&str> = s.get(close + 1..)?.split_ascii_whitespace().collect();
-    // fields after comm, 0-indexed: state=0, utime=11, stime=12, rss pages=21
+    // fields after comm, 0-indexed: state=0, ppid=1, utime=11, stime=12, rss pages=21
+    let ppid: i32 = rest.get(1)?.parse().ok()?;
     let utime: u64 = rest.get(11)?.parse().ok()?;
     let stime: u64 = rest.get(12)?.parse().ok()?;
     let rss_pages: u64 = rest.get(21)?.parse().ok()?;
     Some(ProcessInfo {
         pid,
+        ppid,
         name,
         cpu_ns: (utime + stime).saturating_mul(1_000_000_000 / clk_tck.max(1)),
         rss: rss_pages * page_size,
@@ -587,6 +589,8 @@ mod tests {
         // clk_tck 100 -> 1 tick = 10_000_000 ns; page 4096
         let p = parse_pid_stat(12345, PID_STAT, 100, 4096).unwrap();
         assert_eq!(p.pid, 12345);
+        // fixture line: `... ) S 1 12345 ...` -> ppid is the token after state
+        assert_eq!(p.ppid, 1);
         assert_eq!(p.name, "tmux: server");
         assert_eq!(p.cpu_ns, (1500 + 500) * 10_000_000);
         assert_eq!(p.rss, 2560 * 4096);

@@ -24,7 +24,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         ),
         Span::styled(
             format!(
-                "{} procs, sort {sort} [c/m/i/n] [k]ill [f]ilter [t]hreads ",
+                "{} procs, sort {sort} [c/m/i/n] [k]ill [f]ilter [t]hreads [e]tree ",
                 app.procs.len()
             ),
             Style::new().fg(theme::LABEL),
@@ -64,12 +64,8 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let offset = app.scroll_viewport(visible);
     for (i, p) in app.procs.iter().enumerate().skip(offset).take(visible) {
         let thread = p.tid.is_some();
-        let mut name = if thread {
-            let glyph = if p.last_child { "└─" } else { "├─" };
-            format!("{glyph} {}", p.name)
-        } else {
-            p.name.clone()
-        };
+        // prefix carries the tree rails/glyphs; empty on flat proc rows
+        let mut name = format!("{}{}", p.prefix, p.name);
         // char-boundary-safe cut; byte truncate panics on non-ascii names
         if name.len() > name_w {
             name = name.chars().take(name_w).collect();

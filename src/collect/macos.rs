@@ -2,7 +2,10 @@ use super::{
     CollectError, Collector, CpuSnapshot, CpuTimes, MemSnapshot, MountInfo, NetSnapshot,
     ProcessInfo, Snapshot, ThreadInfo,
 };
-use libc::{CTL_NET, NET_RT_IFLIST2, PF_ROUTE, c_int, c_uint, c_void, sysctl, sysctlbyname};
+use libc::{
+    CTL_KERN, CTL_NET, KERN_PROC, KERN_PROC_ALL, NET_RT_IFLIST2, PF_ROUTE, c_int, c_uint, c_void,
+    sysctl, sysctlbyname,
+};
 
 type KernReturn = c_int;
 type MachPort = c_uint;
@@ -17,13 +20,27 @@ const CPU_STATE_MAX: usize = 4;
 const HOST_VM_INFO64: c_int = 4;
 const RTM_IFINFO2: u8 = 0x12;
 const IFT_LOOP: u8 = 0x18;
-const PROC_ALL_PIDS: u32 = 1;
 const PROC_PIDTASKINFO: c_int = 4;
+/// sys/param.h MAXCOMLEN
+const MAXCOMLEN: usize = 16;
 const PROC_NAME_LEN: usize = 64;
 const PROC_PIDTHREADINFO: c_int = 5;
 const PROC_PIDLISTTHREADS: c_int = 6;
 /// sys/proc_info.h MAXTHREADNAMESIZE
 const THREAD_NAME_LEN: usize = 64;
+/// struct kinfo_proc (sys/sysctl.h + sys/proc.h) — too union-heavy to mirror
+/// in repr(C), so we read the three fields we need at byte offsets instead.
+/// Verified on macOS arm64 by a compiled C probe against the SDK headers:
+///   sizeof(struct kinfo_proc)  = 648
+///   offsetof(kp_proc.p_pid)    = 40
+///   offsetof(kp_proc.p_comm)   = 243   ([c_char; MAXCOMLEN+1])
+///   offsetof(kp_eproc.e_ppid)  = 560
+/// and by a live rust probe: own record matched getpid()/getppid()/"pidprobe",
+/// pid 1 read back as comm="launchd" ppid=0.
+const KINFO_PROC_SIZE: usize = 648;
+const KINFO_P_PID: usize = 40;
+const KINFO_P_COMM: usize = 243;
+const KINFO_E_PPID: usize = 560;
 
 /// mach/vm_statistics.h vm_statistics64 — field order matters
 #[repr(C)]
@@ -183,7 +200,6 @@ unsafe extern "C" {
         info_count: *mut NaturalT,
     ) -> KernReturn;
     fn vm_deallocate(task: MachPort, address: usize, size: usize) -> KernReturn;
-    fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int) -> c_int;
     fn proc_pidinfo(
         pid: c_int,
         flavor: c_int,
@@ -514,43 +530,106 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
     Ok(net)
 }
 
+/// kern.proc.all sweep: one kinfo_proc per process, root-owned included, no
+/// privileges needed. libproc pidinfo can't see other users' pids, and the
+/// old listpids+pidinfo path dropped them — severing the ppid tree at every
+/// system daemon.
+fn kinfo_sweep() -> Result<Vec<u8>, CollectError> {
+    let mut mib = [CTL_KERN, KERN_PROC, KERN_PROC_ALL];
+    for attempt in 0..4 {
+        let mut len: usize = 0;
+        // SAFETY: null buffer asks for the byte count needed
+        let rc = unsafe {
+            sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(CollectError::Sys {
+                call: "sysctl(KERN_PROC_ALL size)",
+                code: rc as i64,
+            });
+        }
+        // the table grows between the two calls — headroom, doubled per retry
+        len += (64 << attempt) * KINFO_PROC_SIZE;
+        let mut buf = vec![0u8; len];
+        // SAFETY: buf is len bytes; the kernel updates len to what it wrote
+        let rc = unsafe {
+            sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 {
+            // a partial trailing record would mean our stride is wrong for
+            // this kernel — bail loudly rather than misread every field
+            if len % KINFO_PROC_SIZE != 0 {
+                return Err(CollectError::Sys {
+                    call: "sysctl(KERN_PROC_ALL) stride",
+                    code: len as i64,
+                });
+            }
+            buf.truncate(len);
+            return Ok(buf);
+        }
+        // ENOMEM: a fork storm outgrew the headroom; go around again
+    }
+    Err(CollectError::Sys {
+        call: "sysctl(KERN_PROC_ALL)",
+        code: -1,
+    })
+}
+
 fn procs_snapshot(threads: bool) -> Result<Vec<ProcessInfo>, CollectError> {
-    // SAFETY: null buffer asks for the byte count needed
-    let bytes = unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-    if bytes <= 0 {
-        return Err(CollectError::Sys {
-            call: "proc_listpids(size)",
-            code: bytes as i64,
-        });
-    }
-    let mut pids = vec![0i32; bytes as usize / 4 + 64];
-    // SAFETY: buffer sized above with headroom for new processes
-    let bytes = unsafe {
-        proc_listpids(
-            PROC_ALL_PIDS,
-            0,
-            pids.as_mut_ptr() as *mut c_void,
-            (pids.len() * 4) as c_int,
-        )
-    };
-    if bytes <= 0 {
-        return Err(CollectError::Sys {
-            call: "proc_listpids",
-            code: bytes as i64,
-        });
-    }
-    pids.truncate(bytes as usize / 4);
+    let table = kinfo_sweep()?;
 
     let mut tb = TimebaseInfo { numer: 0, denom: 0 };
     // SAFETY: plain out-param
     unsafe { mach_timebase_info(&mut tb) };
     let (numer, denom) = (tb.numer.max(1) as u128, tb.denom.max(1) as u128);
 
-    let mut procs = Vec::with_capacity(pids.len());
-    for &pid in &pids {
+    let mut procs = Vec::with_capacity(table.len() / KINFO_PROC_SIZE);
+    for rec in table.chunks_exact(KINFO_PROC_SIZE) {
+        let pid = i32::from_ne_bytes(rec[KINFO_P_PID..KINFO_P_PID + 4].try_into().unwrap());
         if pid <= 0 {
-            continue;
+            continue; // kernel_task's pid 0
         }
+        let ppid = i32::from_ne_bytes(rec[KINFO_E_PPID..KINFO_E_PPID + 4].try_into().unwrap());
+        // p_comm truncates at MAXCOMLEN but works for every pid
+        let comm = &rec[KINFO_P_COMM..KINFO_P_COMM + MAXCOMLEN + 1];
+        let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+        let mut name = String::from_utf8_lossy(&comm[..end]).into_owned();
+        // proc_name has the full name but fails for other users' pids —
+        // upgrade when it works, keep the comm when it doesn't
+        let mut name_buf = [0u8; PROC_NAME_LEN];
+        // SAFETY: buffer is PROC_NAME_LEN bytes
+        let n = unsafe {
+            proc_name(
+                pid,
+                name_buf.as_mut_ptr() as *mut c_void,
+                PROC_NAME_LEN as u32,
+            )
+        };
+        if n > 0 {
+            // the buffer beyond the first NUL is garbage — cut there, do not trim
+            let end = name_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(PROC_NAME_LEN);
+            name = String::from_utf8_lossy(&name_buf[..end]).into_owned();
+        }
+
+        // stats need pidinfo rights we don't have for other users' processes;
+        // failures keep zeros instead of dropping the process
         let mut ti = ProcTaskInfo::default();
         let sz = size_of::<ProcTaskInfo>() as c_int;
         // SAFETY: buffer is exactly PROC_PIDTASKINFO-sized
@@ -563,26 +642,13 @@ fn procs_snapshot(threads: bool) -> Result<Vec<ProcessInfo>, CollectError> {
                 sz,
             )
         };
-        if got != sz {
-            continue; // no permission for other users' processes without root
-        }
-        let mut name_buf = [0u8; PROC_NAME_LEN];
-        // SAFETY: buffer is PROC_NAME_LEN bytes
-        unsafe {
-            proc_name(
-                pid,
-                name_buf.as_mut_ptr() as *mut c_void,
-                PROC_NAME_LEN as u32,
-            )
+        let (cpu_ns, rss) = if got == sz {
+            let ns = ((ti.pti_total_user as u128 + ti.pti_total_system as u128) * numer / denom)
+                .min(u64::MAX as u128) as u64;
+            (ns, ti.pti_resident_size)
+        } else {
+            (0, 0)
         };
-        // the buffer beyond the first NUL is garbage — cut there, do not trim
-        let end = name_buf
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(PROC_NAME_LEN);
-        let name = String::from_utf8_lossy(&name_buf[..end]).into_owned();
-        let cpu_ns = ((ti.pti_total_user as u128 + ti.pti_total_system as u128) * numer / denom)
-            .min(u64::MAX as u128) as u64;
         let mut ru = RusageInfoV2::default();
         // SAFETY: buffer is exactly a rusage_info_v2; the kernel fills it on rc==0
         let rc = unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V2, &mut ru as *mut _ as *mut c_void) };
@@ -596,9 +662,10 @@ fn procs_snapshot(threads: bool) -> Result<Vec<ProcessInfo>, CollectError> {
         };
         procs.push(ProcessInfo {
             pid,
+            ppid,
             name,
             cpu_ns,
-            rss: ti.pti_resident_size,
+            rss,
             disk_read,
             disk_written,
             // hundreds of extra syscalls per tick — only when the view wants it
@@ -709,6 +776,37 @@ mod tests {
         assert!(!self_proc.name.is_empty());
         assert!(!self_proc.name.contains('\0'));
         assert!(self_proc.rss > 0);
+    }
+
+    #[test]
+    fn own_process_reports_real_ppid() {
+        // the kernel knows who spawned us; parent_id() is the ground truth
+        let mut c = MacCollector;
+        let s = c.collect(false).unwrap();
+        let me = std::process::id() as i32;
+        let p = s.procs.iter().find(|p| p.pid == me).unwrap();
+        assert_eq!(p.ppid, std::os::unix::process::parent_id() as i32);
+    }
+
+    #[test]
+    fn sweep_includes_root_owned_processes() {
+        // the point of the KERN_PROC_ALL sweep: pids we can't pidinfo still
+        // show up, so the ppid tree stays rooted
+        let mut c = MacCollector;
+        let s = c.collect(false).unwrap();
+        let p1 = s.procs.iter().find(|p| p.pid == 1);
+        let p1 = p1.expect("pid 1 visible without root");
+        assert_eq!(p1.name, "launchd");
+        assert!(s.procs.iter().any(|p| p.pid != 1 && p.ppid == 1));
+
+        // own name comes from proc_name (full), not the 16-char p_comm; the
+        // test binary is "rmon-<16 hex>" = 21 chars, long enough to catch a
+        // comm truncation and short enough for proc_name's 31-char cap
+        let me = std::process::id() as i32;
+        let p = s.procs.iter().find(|p| p.pid == me).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let exe = exe.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(p.name, exe);
     }
 
     #[test]
