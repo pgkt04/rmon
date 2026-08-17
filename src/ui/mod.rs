@@ -3,6 +3,7 @@ mod cpu;
 mod dsk;
 mod fetch;
 mod fmt;
+mod gpu;
 mod graph;
 mod mem;
 mod meter;
@@ -20,8 +21,9 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use crate::app::App;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let [cpu_area, net_area, dsk_area, proc_area, mem_area] = panels(f.area(), app);
+    let [cpu_area, gpu_area, net_area, dsk_area, proc_area, mem_area] = panels(f.area(), app);
     cpu::draw(f, app, cpu_area);
+    gpu::draw(f, app, gpu_area);
     net::draw(f, app, net_area);
     dsk::draw(f, app, dsk_area);
     proc::draw(f, app, proc_area);
@@ -38,13 +40,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// one source of truth for the frame layout; the mouse handler hit-tests with it
-fn panels(area: Rect, app: &App) -> [Rect; 5] {
+fn panels(area: Rect, app: &App) -> [Rect; 6] {
     // meters + borders; swap meter only exists when the host has swap
     let mem_rows = if app.mem.swap_total > 0 { 5 } else { 4 };
-    let [cpu_area, net_area, band, mem_area] = Layout::vertical([
+    // gpu-less hosts lose zero rows: the panel collapses to nothing
+    let gpu_rows = if app.gpu_util_pct.is_some() || !app.gpu_hist.is_empty() {
+        5
+    } else {
+        0
+    };
+    let [cpu_area, gpu_area, net_area, band, mem_area] = Layout::vertical([
         // a 0-100 scaled graph in a huge box is mostly blank at idle; keep
         // the cpu box short and dense
         Constraint::Percentage(30),
+        Constraint::Length(gpu_rows),
         // per-interface rows with inline sparklines; overflow scrolls, so
         // the panel stays compact
         Constraint::Length(8),
@@ -56,7 +65,7 @@ fn panels(area: Rect, app: &App) -> [Rect; 5] {
     // the proc name column from swimming in blank space on wide terminals
     let [dsk_area, proc_area] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(band);
-    [cpu_area, net_area, dsk_area, proc_area, mem_area]
+    [cpu_area, gpu_area, net_area, dsk_area, proc_area, mem_area]
 }
 
 /// right border column, one row in from each corner; None when the list fits
@@ -175,7 +184,7 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
         }
         return;
     }
-    let [_, net_area, dsk_area, proc_area, _] = panels(frame, app);
+    let [_, _, net_area, dsk_area, proc_area, _] = panels(frame, app);
     // drag/release can wander outside the panel, so handle them before the hit-test
     match m.kind {
         MouseEventKind::Drag(MouseButton::Left) if app.drag_scroll => {
@@ -349,6 +358,7 @@ mod tests {
         app.cpu_temp_c = Some(44.2);
         app.gpu_name = Some("Apple M1 Pro".into());
         app.gpu_util_pct = Some(22.0);
+        app.gpu_hist = (0..60).map(|i| (i % 10) as f64 * 9.5).collect();
         app.core_temps_c = vec![41.0, 43.5, 44.0, 42.2, 40.9, 39.0, 38.5, 38.0, 37.7, 37.2];
         app.net_ifaces = vec![
             crate::app::NetRow {
@@ -401,6 +411,7 @@ mod tests {
         assert!(text.contains(" cpu "));
         assert!(text.contains("c00"));
         assert!(text.contains("c09"));
+        assert!(text.contains(" gpu "));
         assert!(text.contains(" net "));
         assert!(text.contains("en0"));
         assert!(text.contains("↓"));
@@ -424,6 +435,51 @@ mod tests {
     }
 
     #[test]
+    fn gpu_panel_sits_between_cpu_and_net_and_left_the_cpu_box() {
+        let backend = TestBackend::new(190, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        // buffer_text scans top-down, so title order is panel order
+        let cpu = text.find(" cpu ").unwrap();
+        let gpu = text.find(" gpu ").unwrap();
+        let net = text.find(" net ").unwrap();
+        assert!(
+            cpu < gpu && gpu < net,
+            "order: cpu {cpu} gpu {gpu} net {net}"
+        );
+        // the dedicated panel replaced the meter in the cpu overlay
+        let [cpu_area, ..] = panels(Rect::new(0, 0, 190, 46), &app);
+        let buf = term.backend().buffer();
+        for y in cpu_area.y..cpu_area.y + cpu_area.height {
+            let line: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            assert!(!line.contains("gpu"), "gpu remnant in cpu panel: {line}");
+        }
+    }
+
+    #[test]
+    fn gpu_less_host_collapses_the_panel() {
+        let backend = TestBackend::new(190, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        app.gpu_name = None;
+        app.gpu_util_pct = None;
+        app.gpu_hist.clear();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let [_, gpu_area, ..] = panels(Rect::new(0, 0, 190, 46), &app);
+        assert_eq!(gpu_area.height, 0, "no gpu, no rows");
+        let text = buffer_text(&term);
+        assert!(!text.contains(" gpu "));
+        // everything else still draws in the reclaimed space
+        for panel in [" cpu ", " net ", " dsk ", " proc ", " mem "] {
+            assert!(text.contains(panel), "{panel} missing");
+        }
+    }
+
+    #[test]
     fn net_rows_carry_their_own_sparklines() {
         let backend = TestBackend::new(190, 46);
         let mut term = Terminal::new(backend).unwrap();
@@ -431,7 +487,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         // find the en0 row and check for braille cells past the rates text
         let buf = term.backend().buffer();
-        let [_, net_area, _, _, _] = panels(Rect::new(0, 0, 190, 46), &app);
+        let [_, _, net_area, _, _, _] = panels(Rect::new(0, 0, 190, 46), &app);
         let mut found = false;
         for y in net_area.y + 1..net_area.y + net_area.height - 1 {
             let line: String = (0..buf.area.width)
@@ -467,7 +523,7 @@ mod tests {
         let backend = TestBackend::new(80, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
-        let [_, net_area, _, _, _] = panels(frame, &app);
+        let [_, _, net_area, _, _, _] = panels(frame, &app);
         assert!(app.net_rows_cap > 0 && app.net_rows_cap < 10);
 
         // wheel inside the panel moves the viewport, clamped at the overflow
@@ -529,7 +585,7 @@ mod tests {
         let backend = TestBackend::new(80, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
-        let [_, _, dsk_area, _, _] = panels(frame, &app);
+        let [_, _, _, dsk_area, _, _] = panels(frame, &app);
         assert!(app.dsk_rows_cap > 0 && app.dsk_rows_cap < 12);
         let (cx, cy) = (dsk_area.x + 2, dsk_area.y + 2);
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, cx, cy), frame);
@@ -553,7 +609,7 @@ mod tests {
     fn wheel_scrolls_proc_selection() {
         let mut app = fake_app();
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         let (cx, cy) = (proc_area.x + 2, proc_area.y + 2);
         assert_eq!(app.selected, 0);
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, cx, cy), frame);
@@ -578,7 +634,7 @@ mod tests {
     fn click_selects_row_and_borders_do_not() {
         let mut app = fake_app();
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         let down = MouseEventKind::Down(MouseButton::Left);
         // second visible row
         handle_mouse(
@@ -607,7 +663,7 @@ mod tests {
     fn click_maps_through_the_drawn_offset_not_the_selection() {
         let mut app = overflowing_app();
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         // the last frame drew rows 10.. while the selection sits deep at 50
         app.selected = 50;
         app.view_offset = 10;
@@ -678,7 +734,7 @@ mod tests {
     fn scrollbar_rect_matches_draw_position() {
         let frame = Rect::new(0, 0, 80, 40);
         let app = overflowing_app();
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
         // right border column, one row in from each corner (matches the draw margin)
         assert_eq!(
@@ -700,7 +756,7 @@ mod tests {
     fn scrollbar_click_jumps_selection() {
         let mut app = overflowing_app();
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
         let down = MouseEventKind::Down(MouseButton::Left);
         app.selected = 5;
@@ -719,7 +775,7 @@ mod tests {
     fn scrollbar_grab_is_not_a_row_click() {
         let mut app = overflowing_app();
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
         let len = app.procs.len();
         // second track row sits on the first data row; a row click would pick
@@ -739,7 +795,7 @@ mod tests {
     fn scrollbar_drag_follows_row_and_release_stops_it() {
         let mut app = overflowing_app();
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
         let len = app.procs.len();
         let drag = MouseEventKind::Drag(MouseButton::Left);
@@ -780,7 +836,7 @@ mod tests {
     fn drag_without_grab_is_ignored() {
         let mut app = overflowing_app();
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
         handle_mouse(
             &mut app,
@@ -799,7 +855,7 @@ mod tests {
     fn right_border_click_ignored_when_list_fits() {
         let mut app = fake_app(); // two procs, no scrollbar
         let frame = Rect::new(0, 0, 80, 40);
-        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let [_, _, _, _, proc_area, _] = panels(frame, &app);
         assert!(scrollbar_rect(proc_area, app.procs.len()).is_none());
         // a scrollbar grab here would jump to the last proc; a row click lands
         // below the two rows and is ignored either way
@@ -817,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_title_shows_identity_and_gpu_meter() {
+    fn cpu_title_shows_identity_and_gpu_panel_carries_the_meter() {
         let backend = TestBackend::new(100, 46);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = fake_app();
@@ -827,9 +883,9 @@ mod tests {
         assert!(title_row.contains("Apple M1 Pro"), "{title_row}");
         assert!(title_row.contains("44°C"), "{title_row}");
         assert!(title_row.contains("up 1d 2h"), "{title_row}");
-        // gpu meter row: label plus `{name} {util:.1}%` right text
-        assert!(text.contains("gpu "));
-        assert!(text.contains("Apple M1 Pro 22.0%"));
+        // gpu lives in its own panel now: name + current percent in the title
+        assert!(text.contains(" gpu "));
+        assert!(text.contains("22.0%"));
         assert!(text.contains("load 2.14 1.82 1.53"));
         // per-core temp rides on the core meter text
         assert!(text.contains("41°"));
@@ -843,6 +899,7 @@ mod tests {
         app.cpu_name = None;
         app.cpu_temp_c = None;
         app.gpu_name = None;
+        app.gpu_hist.clear();
         app.gpu_util_pct = None;
         app.load_avg = None;
         app.uptime_secs = None;
@@ -882,7 +939,7 @@ mod tests {
             })
             .collect();
         term.draw(|f| draw(f, &mut app)).unwrap();
-        let [_, _, _, proc_area, _] = panels(Rect::new(0, 0, 100, 46), &app);
+        let [_, _, _, _, proc_area, _] = panels(Rect::new(0, 0, 100, 46), &app);
         let col = proc_right_column(&term, proc_area);
         assert!(col.iter().any(|s| s == "█"), "no thumb: {col:?}");
         assert!(col.iter().any(|s| s == "░"), "no track: {col:?}");
@@ -901,7 +958,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let mut app = fake_app(); // two procs, plenty of rows
         term.draw(|f| draw(f, &mut app)).unwrap();
-        let [_, _, _, proc_area, _] = panels(Rect::new(0, 0, 100, 46), &app);
+        let [_, _, _, _, proc_area, _] = panels(Rect::new(0, 0, 100, 46), &app);
         let col = proc_right_column(&term, proc_area);
         assert!(col.iter().all(|s| s != "█" && s != "░"), "{col:?}");
     }

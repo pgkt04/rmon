@@ -84,16 +84,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         inner,
     );
 
-    // core meters, gpu, and load avg float in a box over the graph's right
+    // core meters and load avg float in a box over the graph's right
     // side instead of stealing full-width rows under it
     overlay(f, app, inner);
 }
 
 fn overlay(f: &mut Frame, app: &App, inner: Rect) {
     let ncores = app.core_percents.len() as u16;
-    let content_rows = ncores.div_ceil(2)
-        + u16::from(app.gpu_util_pct.is_some())
-        + u16::from(app.load_avg.is_some());
+    let content_rows = ncores.div_ceil(2) + u16::from(app.load_avg.is_some());
     if content_rows == 0 {
         return;
     }
@@ -138,31 +136,14 @@ fn overlay(f: &mut Frame, app: &App, inner: Rect) {
                 spans.push(Span::raw(" "));
             }
             // right text carries the temp when the sensor reports this core
-            let text = match app.core_temps_c.get(i) {
+            // (NaN = logical cpu with no mapped sensor -> stay blank)
+            let text = match app.core_temps_c.get(i).filter(|t| !t.is_nan()) {
                 Some(t) => format!("{pct:5.1}% {t:3.0}°"),
                 None => format!("{pct:5.1}%"),
             };
             spans.extend(meter(&format!("c{i:02}"), *pct, &text, col_w).spans);
         }
         lines.push(Line::from(spans));
-    }
-    if let Some(util) = app.gpu_util_pct {
-        let pct = format!("{util:.1}%");
-        // truncate the name so label, bar, and right text share the row
-        let max_name = (box_inner.width as usize).saturating_sub(3 + 2 + pct.len() + 9);
-        let name: String = app
-            .gpu_name
-            .as_deref()
-            .unwrap_or("")
-            .chars()
-            .take(max_name)
-            .collect();
-        let text = if name.is_empty() {
-            pct
-        } else {
-            format!("{name} {pct}")
-        };
-        lines.push(meter("gpu", util, &text, box_inner.width));
     }
     if let Some([one, five, fifteen]) = app.load_avg {
         lines.push(Line::from(Span::styled(

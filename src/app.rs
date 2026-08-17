@@ -170,6 +170,8 @@ pub struct App {
     pub core_temps_c: Vec<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
+    /// gpu utilization history, HISTORY-capped; empty on hosts with no gpu
+    pub gpu_hist: VecDeque<f64>,
     pub load_avg: Option<[f64; 3]>,
     pub uptime_secs: Option<u64>,
     pub net_ifaces: Vec<NetRow>,
@@ -742,6 +744,10 @@ impl App {
         self.core_temps_c = s.core_temps_c.clone();
         self.gpu_name = s.gpu_name.clone();
         self.gpu_util_pct = s.gpu_util_pct;
+        // no dt needed: util is already a percentage, so track it every snapshot
+        if let Some(util) = s.gpu_util_pct {
+            push_capped(&mut self.gpu_hist, util);
+        }
         self.load_avg = s.load_avg;
         self.uptime_secs = s.uptime_secs;
         self.net_rx_total = s.net.rx_bytes;
@@ -1159,6 +1165,28 @@ mod tests {
             app.on_event(AppEvent::Snapshot(snap(i * 10, i * 10)));
         }
         assert_eq!(app.cpu_history.len(), HISTORY);
+    }
+
+    #[test]
+    fn gpu_hist_accumulates_from_snapshots() {
+        let mut app = App::default();
+        let mut a = snap(100, 900);
+        a.gpu_util_pct = Some(25.0);
+        app.on_event(AppEvent::Snapshot(a));
+        let mut b = snap(150, 950);
+        b.gpu_util_pct = Some(75.0);
+        app.on_event(AppEvent::Snapshot(b));
+        // unlike cpu it needs no prev to diff against: first snapshot counts
+        assert_eq!(app.gpu_hist, [25.0, 75.0]);
+    }
+
+    #[test]
+    fn gpu_hist_stays_empty_without_a_gpu() {
+        let mut app = App::default();
+        app.on_event(AppEvent::Snapshot(snap(100, 900)));
+        app.on_event(AppEvent::Snapshot(snap(150, 950)));
+        assert!(app.gpu_util_pct.is_none());
+        assert!(app.gpu_hist.is_empty());
     }
 
     #[test]

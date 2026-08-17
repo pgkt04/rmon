@@ -288,10 +288,11 @@ pub fn parse_cpuinfo_model(s: &str) -> Option<String> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const CPU_HWMON: [&str; 4] = ["coretemp", "k10temp", "zenpower", "cpu_thermal"];
 
-/// scan `base` (/sys/class/hwmon) for the first cpu chip; temp1_input is m°C
+/// scan `base` (/sys/class/hwmon) for the first cpu chip; temp1_input is m°C.
+/// per-core temps come back as (core id from the `Core X` label, °C)
 // Only called by the cfg(linux) LinuxCollector, but unit-tested on every OS.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn read_hwmon_cpu_temp(base: &std::path::Path) -> Option<(f64, Vec<f64>)> {
+pub fn read_hwmon_cpu_temp(base: &std::path::Path) -> Option<(f64, Vec<(u64, f64)>)> {
     let mut dirs: Vec<_> = std::fs::read_dir(base)
         .ok()?
         .flatten()
@@ -324,10 +325,11 @@ fn read_milli_temp(path: &std::path::Path) -> Option<f64> {
 }
 
 /// coretemp labels its inputs `Core 0`, `Core 1`, ...; chips without such
-/// labels (k10temp Tctl only) yield an empty vec
+/// labels (k10temp Tctl only) yield an empty vec. Keeps the label's number:
+/// tempN_input file order is NOT guaranteed to match core ids
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn read_core_temps(dir: &std::path::Path) -> Vec<f64> {
-    let mut cores: Vec<(u32, f64)> = Vec::new();
+fn read_core_temps(dir: &std::path::Path) -> Vec<(u64, f64)> {
+    let mut cores: Vec<(u64, f64)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -348,7 +350,7 @@ fn read_core_temps(dir: &std::path::Path) -> Vec<f64> {
         let Some(core_ix) = label.trim().strip_prefix("Core ") else {
             continue;
         };
-        let Ok(core_ix) = core_ix.parse::<u32>() else {
+        let Ok(core_ix) = core_ix.parse::<u64>() else {
             continue;
         };
         if let Some(t) = read_milli_temp(&dir.join(format!("temp{n}_input"))) {
@@ -356,7 +358,44 @@ fn read_core_temps(dir: &std::path::Path) -> Vec<f64> {
         }
     }
     cores.sort_by_key(|(ix, _)| *ix);
-    cores.into_iter().map(|(_, t)| t).collect()
+    cores
+}
+
+/// one temp per logical cpu so the ui can zip temps against per-core rows;
+/// hyperthread siblings share their physical core's reading. No topology ->
+/// today's label-order list. NaN = no sensor for that cpu (renders blank)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn expand_core_temps(labeled: &[(u64, f64)], core_ids: Option<&[u64]>) -> Vec<f64> {
+    if labeled.is_empty() {
+        return Vec::new(); // no per-core sensors; empty keeps the ui narrow
+    }
+    let Some(ids) = core_ids else {
+        return labeled.iter().map(|&(_, t)| t).collect();
+    };
+    // a handful of cores at most; linear scan beats building a map
+    ids.iter()
+        .map(|id| {
+            labeled
+                .iter()
+                .find(|&&(c, _)| c == *id)
+                .map_or(f64::NAN, |&(_, t)| t)
+        })
+        .collect()
+}
+
+/// logical cpu -> physical core id via `base`/cpuN/topology/core_id
+/// (base = /sys/devices/system/cpu); any missing/garbled entry -> None
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_cpu_core_ids(base: &std::path::Path, ncpu: usize) -> Option<Vec<u64>> {
+    (0..ncpu)
+        .map(|n| {
+            std::fs::read_to_string(base.join(format!("cpu{n}/topology/core_id")))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 /// numeric suffix of e.g. hwmon12; unknown names sort last
@@ -481,6 +520,12 @@ impl Collector for LinuxCollector {
             .as_deref()
             .and_then(parse_cpuinfo_model);
         let hwmon = read_hwmon_cpu_temp(std::path::Path::new("/sys/class/hwmon"));
+        // coretemp reports one temp per physical core; the ui draws one row
+        // per logical cpu, so spread readings over hyperthread siblings
+        let core_ids = read_cpu_core_ids(
+            std::path::Path::new("/sys/devices/system/cpu"),
+            cpu.per_core.len(),
+        );
         let (gpu_name, gpu_util_pct) = read_drm_gpu(std::path::Path::new("/sys/class/drm")).unzip();
 
         Ok(Snapshot {
@@ -492,7 +537,9 @@ impl Collector for LinuxCollector {
             procs,
             cpu_name,
             cpu_temp_c: hwmon.as_ref().map(|(t, _)| *t),
-            core_temps_c: hwmon.map(|(_, c)| c).unwrap_or_default(),
+            core_temps_c: hwmon
+                .map(|(_, c)| expand_core_temps(&c, core_ids.as_deref()))
+                .unwrap_or_default(),
             gpu_name,
             gpu_util_pct,
             load_avg: super::load_avg(),
@@ -717,14 +764,80 @@ mod tests {
         std::fs::write(base.join("hwmon1/name"), "coretemp\n").unwrap();
         std::fs::write(base.join("hwmon1/temp1_input"), "44000\n").unwrap();
         assert_eq!(read_hwmon_cpu_temp(&base), Some((44.0, vec![])));
-        // per-core labels appear in coretemp style
+        // per-core labels appear in coretemp style; the label's number is the
+        // core id and must survive, file order is irrelevant
         std::fs::write(base.join("hwmon1/temp2_label"), "Core 0\n").unwrap();
         std::fs::write(base.join("hwmon1/temp2_input"), "41000\n").unwrap();
         std::fs::write(base.join("hwmon1/temp3_label"), "Core 1\n").unwrap();
         std::fs::write(base.join("hwmon1/temp3_input"), "43000\n").unwrap();
         std::fs::write(base.join("hwmon1/temp4_label"), "Package id 0\n").unwrap();
         std::fs::write(base.join("hwmon1/temp4_input"), "45000\n").unwrap();
-        assert_eq!(read_hwmon_cpu_temp(&base), Some((44.0, vec![41.0, 43.0])));
+        assert_eq!(
+            read_hwmon_cpu_temp(&base),
+            Some((44.0, vec![(0, 41.0), (1, 43.0)]))
+        );
+    }
+
+    #[test]
+    fn hwmon_core_labels_out_of_file_order() {
+        // temp2 is NOT guaranteed to be Core 0; map by the label's number
+        let base = scratch("hwmon_order");
+        std::fs::create_dir(base.join("hwmon0")).unwrap();
+        std::fs::write(base.join("hwmon0/name"), "coretemp\n").unwrap();
+        std::fs::write(base.join("hwmon0/temp1_input"), "50000\n").unwrap();
+        std::fs::write(base.join("hwmon0/temp2_label"), "Core 5\n").unwrap();
+        std::fs::write(base.join("hwmon0/temp2_input"), "55000\n").unwrap();
+        std::fs::write(base.join("hwmon0/temp3_label"), "Core 0\n").unwrap();
+        std::fs::write(base.join("hwmon0/temp3_input"), "40000\n").unwrap();
+        assert_eq!(
+            read_hwmon_cpu_temp(&base),
+            Some((50.0, vec![(0, 40.0), (5, 55.0)]))
+        );
+    }
+
+    #[test]
+    fn core_temps_expand_over_hyperthreads() {
+        // 16C/32T intel layout: cpu0..15 -> core 0..15, cpu16..31 same again
+        let labeled: Vec<(u64, f64)> = (0..16).map(|c| (c, 30.0 + c as f64)).collect();
+        let ids: Vec<u64> = (0..16).chain(0..16).collect();
+        let out = expand_core_temps(&labeled, Some(&ids));
+        assert_eq!(out.len(), 32);
+        for cpu in 0..32 {
+            // sibling threads share their physical core's temp
+            assert_eq!(out[cpu], 30.0 + (cpu % 16) as f64);
+        }
+    }
+
+    #[test]
+    fn core_temps_without_topology_keep_label_order() {
+        let labeled = vec![(0, 41.0), (1, 43.0)];
+        assert_eq!(expand_core_temps(&labeled, None), vec![41.0, 43.0]);
+        // no per-core sensors at all stays empty either way
+        assert_eq!(expand_core_temps(&[], Some(&[0, 0])), Vec::<f64>::new());
+        assert_eq!(expand_core_temps(&[], None), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn core_temps_unmatched_core_id_is_nan() {
+        // e.g. an efficiency core the chip has no sensor label for
+        let labeled = vec![(0, 41.0)];
+        let out = expand_core_temps(&labeled, Some(&[0, 7]));
+        assert_eq!(out[0], 41.0);
+        assert!(out[1].is_nan());
+    }
+
+    #[test]
+    fn cpu_core_ids_read_and_missing() {
+        let base = scratch("topology");
+        std::fs::create_dir_all(base.join("cpu0/topology")).unwrap();
+        std::fs::write(base.join("cpu0/topology/core_id"), "0\n").unwrap();
+        std::fs::create_dir_all(base.join("cpu1/topology")).unwrap();
+        std::fs::write(base.join("cpu1/topology/core_id"), "0\n").unwrap();
+        assert_eq!(read_cpu_core_ids(&base, 2), Some(vec![0, 0]));
+        // cpu2 missing entirely -> whole map unusable, caller falls back
+        assert_eq!(read_cpu_core_ids(&base, 3), None);
+        // vm without topology dirs at all
+        assert_eq!(read_cpu_core_ids(&base.join("nope"), 2), None);
     }
 
     #[test]

@@ -124,7 +124,7 @@ pub struct Snapshot {
     /// static per boot but cheap; collectors fill every tick
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
-    /// per-core (or per-sensor-group) temps in reported order; empty = unknown
+    /// one temp per logical cpu (NaN = no sensor for that cpu); empty = unknown
     pub core_temps_c: Vec<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
