@@ -40,6 +40,10 @@ pub struct ProcRow {
     pub cpu_pct: f64,
     pub rss: u64,
     pub io_bps: Option<f64>,
+    /// Some = this row is a thread of `pid`, not a process
+    pub tid: Option<u64>,
+    /// last thread under its parent; picks the └─ glyph
+    pub last_child: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,9 +105,9 @@ pub struct App {
     pub disks: Vec<DiskRow>,
     pub mounts: Vec<MountInfo>,
     pub selected: usize,
-    /// pid under the highlight; the list resorts every snapshot, so the
-    /// index alone would make the selection wander
-    pub selected_pid: Option<i32>,
+    /// (pid, tid) under the highlight; the list resorts every snapshot, so
+    /// the index alone would make the selection wander. tid None = process row
+    pub selected_id: Option<(i32, Option<u64>)>,
     /// true while the mouse is dragging the proc scrollbar thumb
     pub drag_scroll: bool,
     pub sort: SortBy,
@@ -117,6 +121,11 @@ pub struct App {
     pub filter: String,
     /// true while `f` captures keystrokes into the filter
     pub filter_edit: bool,
+    /// `t`: interleave thread rows under their processes
+    pub show_threads: bool,
+    /// thread rows keyed by owning pid, rebuilt every snapshot; refilter
+    /// weaves them into `procs` when show_threads is on
+    threads_by_pid: HashMap<i32, Vec<ProcRow>>,
     pub smart: Vec<SmartInfo>,
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
@@ -267,6 +276,10 @@ impl App {
                 self.sort_procs();
                 self.reanchor();
             }
+            KeyCode::Char('t') => {
+                self.show_threads = !self.show_threads;
+                self.refilter();
+            }
             KeyCode::Char('b') => {
                 let running = self
                     .bench
@@ -278,10 +291,17 @@ impl App {
             }
             KeyCode::Char('k') => {
                 if let Some(p) = self.procs.get(self.selected) {
-                    self.confirm_kill = Some(KillPrompt {
-                        pid: p.pid,
-                        name: p.name.clone(),
-                    });
+                    // a thread row targets its owning process; you can't
+                    // SIGTERM a single thread anyway
+                    let name = if p.tid.is_some() {
+                        self.procs_all
+                            .iter()
+                            .find(|q| q.pid == p.pid)
+                            .map_or_else(|| p.name.clone(), |q| q.name.clone())
+                    } else {
+                        p.name.clone()
+                    };
+                    self.confirm_kill = Some(KillPrompt { pid: p.pid, name });
                 }
             }
             _ => {}
@@ -367,9 +387,49 @@ impl App {
                                 _ => None,
                             }
                         }),
+                        tid: None,
+                        last_child: false,
                     }
                 })
                 .collect();
+
+            self.threads_by_pid.clear();
+            if s.procs.iter().any(|p| !p.threads.is_empty()) {
+                // same delta trick as procs, keyed by (pid, tid) since tids
+                // are only unique within a process on linux
+                let prev_ns: HashMap<(i32, u64), u64> = prev
+                    .procs
+                    .iter()
+                    .flat_map(|p| p.threads.iter().map(|t| ((p.pid, t.tid), t.cpu_ns)))
+                    .collect();
+                for p in &s.procs {
+                    if p.threads.is_empty() {
+                        continue;
+                    }
+                    let rows = p
+                        .threads
+                        .iter()
+                        .map(|t| ProcRow {
+                            pid: p.pid,
+                            // unnamed threads still need a label
+                            name: if t.name.is_empty() {
+                                format!("tid {}", t.tid)
+                            } else {
+                                t.name.clone()
+                            },
+                            cpu_pct: prev_ns
+                                .get(&(p.pid, t.tid))
+                                .map(|q| t.cpu_ns.saturating_sub(*q) as f64 / (dt * 1e7))
+                                .unwrap_or(0.0),
+                            rss: 0,
+                            io_bps: None,
+                            tid: Some(t.tid),
+                            last_child: false,
+                        })
+                        .collect();
+                    self.threads_by_pid.insert(p.pid, rows);
+                }
+            }
 
             let prev_disks: HashMap<&str, &crate::collect::DiskStats> =
                 prev.disks.iter().map(|d| (d.name.as_str(), d)).collect();
@@ -440,6 +500,9 @@ impl App {
     }
 
     fn sort_procs(&mut self) {
+        // thread rows ride under their parent, never sort against processes:
+        // strip them, sort the processes, weave the threads back in
+        self.procs.retain(|p| p.tid.is_none());
         match self.sort {
             SortBy::Cpu => self
                 .procs
@@ -454,6 +517,31 @@ impl App {
                 .procs
                 .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         }
+        if !self.show_threads {
+            return;
+        }
+        let parents = std::mem::take(&mut self.procs);
+        let mut out = Vec::with_capacity(parents.len());
+        for p in parents {
+            let pid = p.pid;
+            out.push(p);
+            let Some(ts) = self.threads_by_pid.get(&pid) else {
+                continue;
+            };
+            let mut ts = ts.clone();
+            match self.sort {
+                // tid tie-break keeps equal threads from shuffling every tick
+                SortBy::Name => ts.sort_by(|a, b| {
+                    (a.name.to_lowercase(), a.tid).cmp(&(b.name.to_lowercase(), b.tid))
+                }),
+                _ => ts.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(a.tid.cmp(&b.tid))),
+            }
+            if let Some(last) = ts.last_mut() {
+                last.last_child = true;
+            }
+            out.extend(ts);
+        }
+        self.procs = out;
     }
 
     /// re-derive the visible list from procs_all, then sort and reanchor.
@@ -476,29 +564,29 @@ impl App {
         self.reanchor();
     }
 
-    /// move the highlight and remember which process sits under it
+    /// move the highlight and remember which row sits under it
     pub fn select(&mut self, idx: usize) {
         self.selected = idx;
-        self.selected_pid = self.procs.get(idx).map(|p| p.pid);
+        self.selected_id = self.procs.get(idx).map(|p| (p.pid, p.tid));
     }
 
-    /// after a resort, chase the anchored pid to its new index. a dead pid
+    /// after a resort, chase the anchored row to its new index. a dead row
     /// keeps the old (clamped) spot and adopts whatever sits there now.
     /// a drag in flight wins over the anchor: the pointer sets the position
     fn reanchor(&mut self) {
         if self.drag_scroll {
             self.selected = self.selected.min(self.procs.len().saturating_sub(1));
-            self.selected_pid = self.procs.get(self.selected).map(|p| p.pid);
+            self.selected_id = self.procs.get(self.selected).map(|p| (p.pid, p.tid));
             return;
         }
         match self
-            .selected_pid
-            .and_then(|pid| self.procs.iter().position(|p| p.pid == pid))
+            .selected_id
+            .and_then(|(pid, tid)| self.procs.iter().position(|p| p.pid == pid && p.tid == tid))
         {
             Some(idx) => self.selected = idx,
             None => {
                 self.selected = self.selected.min(self.procs.len().saturating_sub(1));
-                self.selected_pid = self.procs.get(self.selected).map(|p| p.pid);
+                self.selected_id = self.procs.get(self.selected).map(|p| (p.pid, p.tid));
             }
         }
     }
@@ -508,7 +596,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::collect::{
-        CpuSnapshot, CpuTimes, DiskStats, MountInfo, NetSnapshot, ProcessInfo, Snapshot,
+        CpuSnapshot, CpuTimes, DiskStats, MountInfo, NetSnapshot, ProcessInfo, Snapshot, ThreadInfo,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use std::time::{Duration, Instant};
@@ -540,6 +628,7 @@ mod tests {
             rss: 100,
             disk_read: Some(1 << 20),
             disk_written: Some(0),
+            threads: Vec::new(),
         }];
         let mut b = snap(150, 950);
         b.taken = base + Duration::from_secs(1);
@@ -556,6 +645,7 @@ mod tests {
                 rss: 100,
                 disk_read: Some(3 << 20),
                 disk_written: Some(1 << 20),
+                threads: Vec::new(),
             },
             ProcessInfo {
                 pid: 2,
@@ -564,6 +654,7 @@ mod tests {
                 rss: 9_000,
                 disk_read: None,
                 disk_written: None,
+                threads: Vec::new(),
             },
         ];
         (a, b)
@@ -596,6 +687,8 @@ mod tests {
             cpu_pct: 0.0,
             rss: 0,
             io_bps: None,
+            tid: None,
+            last_child: false,
         }
     }
 
@@ -733,7 +826,7 @@ mod tests {
         // cpu sort put alpha first; anchor the highlight on beta (pid 2)
         assert_eq!(app.procs[0].name, "alpha");
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Down)));
-        assert_eq!((app.selected, app.selected_pid), (1, Some(2)));
+        assert_eq!((app.selected, app.selected_id), (1, Some((2, None))));
 
         // next tick beta burns cpu and alpha idles -> the order flips
         let mut c = snap(200, 1000);
@@ -746,6 +839,7 @@ mod tests {
                 rss: 100,
                 disk_read: Some(3 << 20),
                 disk_written: Some(1 << 20),
+                threads: Vec::new(),
             },
             ProcessInfo {
                 pid: 2,
@@ -754,12 +848,13 @@ mod tests {
                 rss: 9_000,
                 disk_read: None,
                 disk_written: None,
+                threads: Vec::new(),
             },
         ];
         app.on_event(AppEvent::Snapshot(c));
         assert_eq!(app.procs[0].name, "beta");
         assert_eq!(app.selected, 0, "highlight chased beta to the top");
-        assert_eq!(app.selected_pid, Some(2));
+        assert_eq!(app.selected_id, Some((2, None)));
 
         // beta dies: keep the spot, adopt whoever sits there now
         let mut d = snap(250, 1050);
@@ -771,9 +866,10 @@ mod tests {
             rss: 100,
             disk_read: Some(3 << 20),
             disk_written: Some(1 << 20),
+            threads: Vec::new(),
         }];
         app.on_event(AppEvent::Snapshot(d));
-        assert_eq!((app.selected, app.selected_pid), (0, Some(1)));
+        assert_eq!((app.selected, app.selected_id), (0, Some((1, None))));
     }
 
     fn key(app: &mut App, code: KeyCode) {
@@ -797,7 +893,11 @@ mod tests {
         }
         assert_eq!(app.procs.len(), 1);
         assert_eq!(app.procs[0].name, "beta");
-        assert_eq!(app.selected_pid, Some(2), "selection adopted the match");
+        assert_eq!(
+            app.selected_id,
+            Some((2, None)),
+            "selection adopted the match"
+        );
 
         // enter commits; the next snapshot must not resurrect hidden rows
         key(&mut app, KeyCode::Enter);
@@ -812,6 +912,7 @@ mod tests {
                 rss: 100,
                 disk_read: Some(3 << 20),
                 disk_written: Some(1 << 20),
+                threads: Vec::new(),
             },
             ProcessInfo {
                 pid: 2,
@@ -820,6 +921,7 @@ mod tests {
                 rss: 9_000,
                 disk_read: None,
                 disk_written: None,
+                threads: Vec::new(),
             },
         ];
         app.on_event(AppEvent::Snapshot(c));
@@ -867,18 +969,18 @@ mod tests {
     }
 
     #[test]
-    fn sort_key_keeps_the_selected_pid() {
+    fn sort_key_keeps_the_selected_row() {
         let mut app = App::default();
         let (a, b) = pair();
         app.on_event(AppEvent::Snapshot(a));
         app.on_event(AppEvent::Snapshot(b));
         // cpu sort: [alpha, beta]; select alpha, then sort by mem flips the order
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Up)));
-        assert_eq!(app.selected_pid, Some(1));
+        assert_eq!(app.selected_id, Some((1, None)));
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('m'))));
         assert_eq!(app.procs[0].name, "beta");
         assert_eq!(app.selected, 1, "alpha stays highlighted after the resort");
-        assert_eq!(app.selected_pid, Some(1));
+        assert_eq!(app.selected_id, Some((1, None)));
     }
 
     #[test]
@@ -955,7 +1057,7 @@ mod tests {
             procs: vec![row(1, "Zed"), row(2, "alpha"), row(3, "Beta")],
             ..App::default()
         };
-        app.selected_pid = Some(1);
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('n'))));
         assert_eq!(app.sort, SortBy::Name);
         let names: Vec<&str> = app.procs.iter().map(|p| p.name.as_str()).collect();
@@ -1119,5 +1221,201 @@ mod tests {
         app.on_event(AppEvent::Smart(vec![info("disk1"), info("disk2")]));
         assert_eq!(app.smart.len(), 2, "second event replaces, not appends");
         assert_eq!(app.smart[0].device, "disk1");
+    }
+
+    fn tproc(pid: i32, name: &str, cpu_ns: u64, rss: u64, threads: Vec<ThreadInfo>) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            name: name.into(),
+            cpu_ns,
+            rss,
+            disk_read: None,
+            disk_written: None,
+            threads,
+        }
+    }
+
+    fn tinfo(tid: u64, name: &str, cpu_ns: u64) -> ThreadInfo {
+        ThreadInfo {
+            tid,
+            name: name.into(),
+            cpu_ns,
+        }
+    }
+
+    // two snapshots 1s apart: alpha at 50% with two threads (30% + 10%),
+    // beta at 10% with none. cpu sort -> [alpha, beta]
+    fn thread_pair() -> (Box<Snapshot>, Box<Snapshot>) {
+        let base = Instant::now();
+        let mut a = snap(100, 900);
+        a.taken = base;
+        a.procs = vec![
+            tproc(
+                1,
+                "alpha",
+                0,
+                500,
+                vec![tinfo(10, "worker", 0), tinfo(11, "", 0)],
+            ),
+            tproc(2, "beta", 0, 100, vec![]),
+        ];
+        let mut b = snap(150, 950);
+        b.taken = base + Duration::from_secs(1);
+        b.procs = vec![
+            tproc(
+                1,
+                "alpha",
+                500_000_000,
+                500,
+                vec![tinfo(10, "worker", 300_000_000), tinfo(11, "", 100_000_000)],
+            ),
+            tproc(2, "beta", 100_000_000, 100, vec![]),
+        ];
+        (a, b)
+    }
+
+    #[test]
+    fn t_flattens_threads_under_parent_and_collapses() {
+        let mut app = App::default();
+        let (a, b) = thread_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        assert_eq!(app.procs.len(), 2, "threads hidden until toggled");
+
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.show_threads);
+        let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
+        // threads cpu-desc under alpha: worker (30%) before the unnamed one (10%)
+        assert_eq!(ids, [(1, None), (1, Some(10)), (1, Some(11)), (2, None)]);
+        assert_eq!(app.procs[2].name, "tid 11", "unnamed thread gets a label");
+        let last: Vec<bool> = app.procs.iter().map(|p| p.last_child).collect();
+        assert_eq!(last, [false, false, true, false]);
+        assert_eq!(app.procs[1].rss, 0);
+        assert!(app.procs[1].io_bps.is_none());
+
+        // name sort flips the thread order: "tid 11" < "worker"
+        key(&mut app, KeyCode::Char('n'));
+        let names: Vec<&str> = app.procs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "tid 11", "worker", "beta"]);
+        assert!(app.procs[2].last_child);
+
+        key(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.procs.len(), 2, "second t collapses");
+        assert!(app.procs.iter().all(|p| p.tid.is_none()));
+    }
+
+    #[test]
+    fn thread_cpu_pct_from_tid_delta() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('t'));
+        let (a, b) = thread_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        // worker burned 300ms in 1s, the unnamed thread 100ms
+        let worker = app.procs.iter().find(|p| p.tid == Some(10)).unwrap();
+        assert!((worker.cpu_pct - 30.0).abs() < 1.0);
+        let unnamed = app.procs.iter().find(|p| p.tid == Some(11)).unwrap();
+        assert!((unnamed.cpu_pct - 10.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn selection_follows_thread_across_resort_and_falls_back() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('t'));
+        let (a, b) = thread_pair();
+        let base = a.taken;
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        // [alpha, worker, tid 11, beta]; anchor on worker
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_id, Some((1, Some(10))));
+
+        // beta takes off and alpha idles; only tid 11 keeps burning ->
+        // [beta, alpha, tid 11, worker]
+        let mut c = snap(200, 1000);
+        c.taken = base + Duration::from_secs(2);
+        c.procs = vec![
+            tproc(
+                1,
+                "alpha",
+                500_000_000,
+                500,
+                vec![tinfo(10, "worker", 300_000_000), tinfo(11, "", 150_000_000)],
+            ),
+            tproc(2, "beta", 900_000_000, 100, vec![]),
+        ];
+        app.on_event(AppEvent::Snapshot(c));
+        assert_eq!(app.procs[3].tid, Some(10));
+        assert_eq!(app.selected, 3, "highlight chased the thread row");
+        assert_eq!(app.selected_id, Some((1, Some(10))));
+
+        // worker dies: keep the (clamped) spot, adopt whoever sits there
+        let mut d = snap(250, 1050);
+        d.taken = base + Duration::from_secs(3);
+        d.procs = vec![
+            tproc(
+                1,
+                "alpha",
+                500_000_000,
+                500,
+                vec![tinfo(11, "", 200_000_000)],
+            ),
+            tproc(2, "beta", 1_000_000_000, 100, vec![]),
+        ];
+        app.on_event(AppEvent::Snapshot(d));
+        assert_eq!(app.procs.len(), 3);
+        assert_eq!((app.selected, app.selected_id), (2, Some((1, Some(11)))));
+    }
+
+    #[test]
+    fn k_on_thread_row_targets_the_parent_process() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('t'));
+        let (a, b) = thread_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        // move onto worker (a thread of alpha) and hit k
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.procs[app.selected].tid, Some(10));
+        key(&mut app, KeyCode::Char('k'));
+        let kp = app.confirm_kill.as_ref().expect("prompt opens");
+        assert_eq!((kp.pid, kp.name.as_str()), (1, "alpha"));
+        key(&mut app, KeyCode::Esc);
+    }
+
+    #[test]
+    fn filter_hides_threads_with_their_parent() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('t'));
+        let (a, b) = thread_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+
+        // alpha filtered out -> its threads go with it
+        key(&mut app, KeyCode::Char('f'));
+        for c in "beta".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.procs.len(), 1);
+        assert_eq!(app.procs[0].name, "beta");
+
+        // visible parent brings its threads back
+        for _ in 0..4 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        for c in "alpha".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
+        assert_eq!(ids, [(1, None), (1, Some(10)), (1, Some(11))]);
+    }
+
+    #[test]
+    fn t_while_filter_editing_is_text_not_a_toggle() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Char('t'));
+        assert!(!app.show_threads);
+        assert_eq!(app.filter, "t");
     }
 }

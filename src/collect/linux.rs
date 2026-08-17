@@ -1,5 +1,6 @@
 use super::{
     CollectError, CpuSnapshot, CpuTimes, DiskStats, MemSnapshot, NetSnapshot, ProcessInfo,
+    ThreadInfo,
 };
 #[cfg(target_os = "linux")]
 use super::{Collector, MountInfo, Snapshot};
@@ -123,7 +124,54 @@ pub fn parse_pid_stat(pid: i32, s: &str, clk_tck: u64, page_size: u64) -> Option
         rss: rss_pages * page_size,
         disk_read: None,
         disk_written: None,
+        threads: Vec::new(),
     })
+}
+
+/// one /proc/[pid]/task/[tid]/stat line; same layout as the pid stat, so the
+/// comm splits at the LAST ')' too
+// Only called by the cfg(linux) LinuxCollector, but unit-tested on every OS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_tid_stat(tid: u64, s: &str, clk_tck: u64) -> Option<ThreadInfo> {
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    let name = s.get(open + 1..close)?.to_string();
+    let rest: Vec<&str> = s.get(close + 1..)?.split_ascii_whitespace().collect();
+    // fields after comm, 0-indexed: utime=11, stime=12
+    let utime: u64 = rest.get(11)?.parse().ok()?;
+    let stime: u64 = rest.get(12)?.parse().ok()?;
+    Some(ThreadInfo {
+        tid,
+        name,
+        cpu_ns: (utime + stime).saturating_mul(1_000_000_000 / clk_tck.max(1)),
+    })
+}
+
+/// every tid under /proc/[pid]/task, main thread included; threads exit
+/// mid-scan constantly, so anything unreadable is skipped, never an error
+#[cfg(target_os = "linux")]
+fn read_task_threads(task_dir: &std::path::Path, clk_tck: u64) -> Vec<ThreadInfo> {
+    let Ok(entries) = std::fs::read_dir(task_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some(t) = parse_tid_stat(tid, &stat, clk_tck) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// /proc/[pid]/io: block-layer read_bytes/write_bytes lines
@@ -364,7 +412,7 @@ pub struct LinuxCollector;
 
 #[cfg(target_os = "linux")]
 impl Collector for LinuxCollector {
-    fn collect(&mut self) -> Result<Snapshot, CollectError> {
+    fn collect(&mut self, threads: bool) -> Result<Snapshot, CollectError> {
         let cpu = parse_proc_stat(&std::fs::read_to_string("/proc/stat")?)?;
         let mem = parse_meminfo(&std::fs::read_to_string("/proc/meminfo")?)?;
         let net = parse_net_dev(&std::fs::read_to_string("/proc/net/dev")?);
@@ -391,6 +439,10 @@ impl Collector for LinuxCollector {
                 {
                     p.disk_read = Some(r);
                     p.disk_written = Some(w);
+                }
+                // opt-in: this is one dir listing + a file per thread, per tick
+                if threads {
+                    p.threads = read_task_threads(&entry.path().join("task"), clk_tck);
                 }
                 procs.push(p);
             }
@@ -544,6 +596,29 @@ mod tests {
     fn pid_stat_rejects_garbage() {
         assert!(parse_pid_stat(1, "not a stat line", 100, 4096).is_none());
         assert!(parse_pid_stat(1, "1 (x) S 2 3", 100, 4096).is_none());
+    }
+
+    #[test]
+    fn tid_stat_parses_thread_name_and_cpu() {
+        // realistic tokio worker line; comm holds the thread name, not the
+        // process name. clk_tck 100 -> 1 tick = 10_000_000 ns
+        let line = "12347 (tokio-runtime-w) S 1 12345 12345 0 -1 4194368 100 0 0 0 42 8 0 0 20 0 9 0 12000 100000000 2560 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0\n";
+        let t = parse_tid_stat(12347, line, 100).unwrap();
+        assert_eq!(t.tid, 12347);
+        assert_eq!(t.name, "tokio-runtime-w");
+        assert_eq!(t.cpu_ns, (42 + 8) * 10_000_000);
+        // parens/spaces inside comm still split at the last ')'
+        let weird = "9 (a) b) S 1 2 3 0 -1 0 0 0 0 0 7 3 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        let t = parse_tid_stat(9, weird, 100).unwrap();
+        assert_eq!(t.name, "a) b");
+        assert_eq!(t.cpu_ns, (7 + 3) * 10_000_000);
+    }
+
+    #[test]
+    fn tid_stat_rejects_garbage() {
+        assert!(parse_tid_stat(1, "not a stat line", 100).is_none());
+        assert!(parse_tid_stat(1, "1 (x) S 2 3", 100).is_none());
+        assert!(parse_tid_stat(1, "", 100).is_none());
     }
 
     #[test]

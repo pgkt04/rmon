@@ -24,7 +24,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(
             format!(
-                "{} procs, sort {sort} [c/m/i/n] [k]ill [f]ilter ",
+                "{} procs, sort {sort} [c/m/i/n] [k]ill [f]ilter [t]hreads ",
                 app.procs.len()
             ),
             Style::new().fg(theme::LABEL),
@@ -63,22 +63,43 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let visible = inner.height as usize - 1;
     let offset = app.selected.saturating_sub(visible.saturating_sub(1));
     for (i, p) in app.procs.iter().enumerate().skip(offset).take(visible) {
-        let mut name = p.name.clone();
+        let thread = p.tid.is_some();
+        let mut name = if thread {
+            let glyph = if p.last_child { "└─" } else { "├─" };
+            format!("{glyph} {}", p.name)
+        } else {
+            p.name.clone()
+        };
         // char-boundary-safe cut; byte truncate panics on non-ascii names
         if name.len() > name_w {
             name = name.chars().take(name_w).collect();
         }
+        // thread rows: tid in the pid column, blank mem/io (widths kept so
+        // nothing shifts), dimmer name. macos "tids" are 10-digit pthread
+        // handles that would blow the column: blank them, the name row
+        // fallback ("tid N") still carries the identity
+        let id = match p.tid {
+            None => format!("{:>7} ", p.pid),
+            Some(t) if t <= 9_999_999 => format!("{t:>7} "),
+            Some(_) => format!("{:>7} ", ""),
+        };
+        let name_fg = if thread { theme::LABEL } else { theme::TITLE };
         let row = Line::from(vec![
-            Span::styled(format!("{:>7} ", p.pid), Style::new().fg(theme::LABEL)),
-            Span::styled(format!("{name:<name_w$} "), Style::new().fg(theme::TITLE)),
+            Span::styled(id, Style::new().fg(theme::LABEL)),
+            Span::styled(format!("{name:<name_w$} "), Style::new().fg(name_fg)),
             Span::styled(
-                format!("{:>9} ", humanize(p.rss)),
+                if thread {
+                    format!("{:>9} ", "")
+                } else {
+                    format!("{:>9} ", humanize(p.rss))
+                },
                 Style::new().fg(theme::LABEL),
             ),
             Span::styled(
-                match p.io_bps {
-                    Some(v) => format!("{:>11} ", rate(v)),
-                    None => format!("{:>11} ", "—"),
+                match (thread, p.io_bps) {
+                    (true, _) => format!("{:>11} ", ""),
+                    (false, Some(v)) => format!("{:>11} ", rate(v)),
+                    (false, None) => format!("{:>11} ", "—"),
                 },
                 Style::new().fg(theme::LABEL),
             ),

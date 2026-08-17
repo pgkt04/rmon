@@ -78,6 +78,15 @@ pub struct MountInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct ThreadInfo {
+    pub tid: u64,
+    /// thread name; empty when the OS has none
+    pub name: String,
+    /// cumulative cpu time in ns (user + system)
+    pub cpu_ns: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: i32,
     pub name: String,
@@ -89,6 +98,9 @@ pub struct ProcessInfo {
     /// None when the process is not ours to inspect
     pub disk_read: Option<u64>,
     pub disk_written: Option<u64>,
+    /// per-thread breakdown; only filled when the caller asked for it
+    /// (it costs a pile of extra syscalls), empty on per-process errors too
+    pub threads: Vec<ThreadInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,7 +145,9 @@ impl Default for Snapshot {
 }
 
 pub trait Collector: Send {
-    fn collect(&mut self) -> Result<Snapshot, CollectError>;
+    /// `threads`: also collect per-thread info; skipped when false because
+    /// it's hundreds of extra file reads/syscalls per tick
+    fn collect(&mut self, threads: bool) -> Result<Snapshot, CollectError>;
 }
 
 /// 1/5/15 minute load averages; same libc call on linux and macos

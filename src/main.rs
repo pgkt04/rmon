@@ -4,7 +4,8 @@ mod collect;
 mod smart;
 mod ui;
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -26,10 +27,14 @@ fn main() -> Result<()> {
 
     let collector_tx = tx.clone();
     let tx_bench = tx.clone();
+    // the collector thread only pays for per-thread stats while the t
+    // toggle is on; the ui side flips this after every key
+    let show_threads = Arc::new(AtomicBool::new(false));
+    let collect_threads = show_threads.clone();
     thread::spawn(move || {
         let mut collector = collect::new_collector();
         loop {
-            let ev = match collector.collect() {
+            let ev = match collector.collect(collect_threads.load(Relaxed)) {
                 Ok(s) => AppEvent::Snapshot(Box::new(s)),
                 Err(e) => AppEvent::CollectError(e.to_string()),
             };
@@ -92,7 +97,7 @@ fn main() -> Result<()> {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
         hook(info);
     }));
-    let res = run(&mut terminal, rx, tx_bench);
+    let res = run(&mut terminal, rx, tx_bench, &show_threads);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
@@ -102,6 +107,7 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     rx: mpsc::Receiver<AppEvent>,
     tx_bench: mpsc::Sender<AppEvent>,
+    show_threads: &AtomicBool,
 ) -> Result<()> {
     let mut app = App::default();
     while !app.quit {
@@ -112,7 +118,10 @@ fn run(
                 let frame = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 ui::handle_mouse(&mut app, m, frame);
             }
-            Ok(ev) => app.on_event(ev),
+            Ok(ev) => {
+                app.on_event(ev);
+                show_threads.store(app.show_threads, Relaxed);
+            }
             Err(_) => break,
         }
         // the picker (b key) chose a target; unwritable dirs surface as a

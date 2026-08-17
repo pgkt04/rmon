@@ -198,6 +198,8 @@ mod tests {
                 cpu_pct: 42.0,
                 rss: 1 << 30,
                 io_bps: Some(2.0 * 1024.0 * 1024.0),
+                tid: None,
+                last_child: false,
             },
             ProcRow {
                 pid: 777,
@@ -205,6 +207,8 @@ mod tests {
                 cpu_pct: 1.5,
                 rss: 8 << 20,
                 io_bps: None,
+                tid: None,
+                last_child: false,
             },
         ];
         app.disk_io = (0..60).map(|i| (i % 8) as f64 * 3_000_000.0).collect();
@@ -359,6 +363,8 @@ mod tests {
                 cpu_pct: 0.0,
                 rss: 0,
                 io_bps: None,
+                tid: None,
+                last_child: false,
             })
             .collect();
         app
@@ -599,6 +605,8 @@ mod tests {
                 cpu_pct: 0.0,
                 rss: 0,
                 io_bps: None,
+                tid: None,
+                last_child: false,
             })
             .collect();
         term.draw(|f| draw(f, &app)).unwrap();

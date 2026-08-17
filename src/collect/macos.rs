@@ -1,6 +1,6 @@
 use super::{
     CollectError, Collector, CpuSnapshot, CpuTimes, MemSnapshot, MountInfo, NetSnapshot,
-    ProcessInfo, Snapshot,
+    ProcessInfo, Snapshot, ThreadInfo,
 };
 use libc::{CTL_NET, NET_RT_IFLIST2, PF_ROUTE, c_int, c_uint, c_void, sysctl, sysctlbyname};
 
@@ -20,6 +20,10 @@ const IFT_LOOP: u8 = 0x18;
 const PROC_ALL_PIDS: u32 = 1;
 const PROC_PIDTASKINFO: c_int = 4;
 const PROC_NAME_LEN: usize = 64;
+const PROC_PIDTHREADINFO: c_int = 5;
+const PROC_PIDLISTTHREADS: c_int = 6;
+/// sys/proc_info.h MAXTHREADNAMESIZE
+const THREAD_NAME_LEN: usize = 64;
 
 /// mach/vm_statistics.h vm_statistics64 — field order matters
 #[repr(C)]
@@ -113,6 +117,22 @@ struct ProcTaskInfo {
     pti_priority: i32,
 }
 
+/// sys/proc_info.h proc_threadinfo — layout checked against the 26.x SDK header
+#[repr(C)]
+struct ProcThreadInfo {
+    pth_user_time: u64,
+    pth_system_time: u64,
+    pth_cpu_usage: i32,
+    pth_policy: i32,
+    pth_run_state: i32,
+    pth_flags: i32,
+    pth_sleep_time: i32,
+    pth_curpri: i32,
+    pth_priority: i32,
+    pth_maxpriority: i32,
+    pth_name: [u8; THREAD_NAME_LEN],
+}
+
 const RUSAGE_INFO_V2: c_int = 2;
 
 /// sys/resource.h rusage_info_v2 — only the tail fields matter here,
@@ -183,7 +203,7 @@ unsafe extern "C" {
 pub struct MacCollector;
 
 impl Collector for MacCollector {
-    fn collect(&mut self) -> Result<Snapshot, CollectError> {
+    fn collect(&mut self, threads: bool) -> Result<Snapshot, CollectError> {
         let brand = cached_cpu_brand();
         let (cpu_temp_c, core_temps_c) = super::macos_sensors::cpu_temps();
         Ok(Snapshot {
@@ -192,7 +212,7 @@ impl Collector for MacCollector {
             net: net_snapshot()?,
             disks: super::macos_iokit::disks()?,
             mounts: mounts_snapshot(),
-            procs: procs_snapshot()?,
+            procs: procs_snapshot(threads)?,
             cpu_name: brand.clone(),
             cpu_temp_c,
             core_temps_c,
@@ -494,7 +514,7 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
     Ok(net)
 }
 
-fn procs_snapshot() -> Result<Vec<ProcessInfo>, CollectError> {
+fn procs_snapshot(threads: bool) -> Result<Vec<ProcessInfo>, CollectError> {
     // SAFETY: null buffer asks for the byte count needed
     let bytes = unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
     if bytes <= 0 {
@@ -581,9 +601,76 @@ fn procs_snapshot() -> Result<Vec<ProcessInfo>, CollectError> {
             rss: ti.pti_resident_size,
             disk_read,
             disk_written,
+            // hundreds of extra syscalls per tick — only when the view wants it
+            threads: if threads {
+                threads_snapshot(pid, ti.pti_threadnum)
+            } else {
+                Vec::new()
+            },
         });
     }
     Ok(procs)
+}
+
+/// per-thread cpu + name via PROC_PIDLISTTHREADS/PROC_PIDTHREADINFO;
+/// any failure degrades to an empty vec (other users' pids fail routinely)
+fn threads_snapshot(pid: c_int, threadnum: i32) -> Vec<ThreadInfo> {
+    // taskinfo's thread count sizes the handle buffer; headroom for
+    // threads spawned since that call
+    let cap = threadnum.max(1) as usize + 8;
+    let mut handles = vec![0u64; cap];
+    // SAFETY: buffer sized above; kernel writes at most buffersize bytes
+    let got = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDLISTTHREADS,
+            0,
+            handles.as_mut_ptr() as *mut c_void,
+            (cap * size_of::<u64>()) as c_int,
+        )
+    };
+    if got <= 0 {
+        return Vec::new();
+    }
+    handles.truncate(got as usize / size_of::<u64>());
+
+    let mut out = Vec::with_capacity(handles.len());
+    for &handle in &handles {
+        if handle == 0 {
+            continue; // stale buffer slot, not a thread
+        }
+        // SAFETY: all-zero is a valid proc_threadinfo; kernel overwrites on success
+        let mut ti: ProcThreadInfo = unsafe { std::mem::zeroed() };
+        let sz = size_of::<ProcThreadInfo>() as c_int;
+        // SAFETY: buffer is exactly PROC_PIDTHREADINFO-sized
+        let r = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTHREADINFO,
+                handle,
+                &mut ti as *mut _ as *mut c_void,
+                sz,
+            )
+        };
+        if r != sz {
+            continue; // thread exited between the two calls
+        }
+        let end = ti
+            .pth_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(THREAD_NAME_LEN);
+        let name = String::from_utf8_lossy(&ti.pth_name[..end]).into_owned();
+        out.push(ThreadInfo {
+            tid: handle,
+            name,
+            // pth_*_time are already ns (xnu converts thread_basic_info's
+            // time_value_t) — NOT mach ticks like pti_total_*; live probe on
+            // this M1 showed a ~100ms burn thread report ~110_814_000
+            cpu_ns: ti.pth_user_time.saturating_add(ti.pth_system_time),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -594,9 +681,9 @@ mod tests {
     #[test]
     fn collects_sane_values() {
         let mut c = MacCollector;
-        let a = c.collect().unwrap();
+        let a = c.collect(false).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let b = c.collect().unwrap();
+        let b = c.collect(false).unwrap();
 
         assert!(!a.cpu.per_core.is_empty());
         assert_eq!(a.cpu.per_core.len(), b.cpu.per_core.len());
@@ -611,7 +698,7 @@ mod tests {
     #[test]
     fn net_and_procs_are_sane() {
         let mut c = MacCollector;
-        let s = c.collect().unwrap();
+        let s = c.collect(false).unwrap();
         // this machine always has non-loopback traffic and processes
         assert!(s.net.rx_bytes > 0);
         assert!(s.net.tx_bytes > 0);
@@ -627,7 +714,7 @@ mod tests {
     #[test]
     fn disks_and_mounts_are_sane() {
         let mut c = MacCollector;
-        let s = c.collect().unwrap();
+        let s = c.collect(false).unwrap();
         // every mac has at least one physical whole disk with counters
         assert!(!s.disks.is_empty());
         assert!(
@@ -654,10 +741,54 @@ mod tests {
         let path = std::env::temp_dir().join("rmon_io_probe");
         std::fs::write(&path, vec![7u8; 1 << 20]).unwrap();
         let mut c = MacCollector;
-        let s = c.collect().unwrap();
+        let s = c.collect(false).unwrap();
         let _ = std::fs::remove_file(&path);
         let me = std::process::id() as i32;
         let p = s.procs.iter().find(|p| p.pid == me).unwrap();
         assert!(p.disk_read.is_some() && p.disk_written.is_some());
+    }
+
+    #[test]
+    fn own_process_reports_named_threads() {
+        // burn ~100ms of cpu in a named thread so it shows measurable time,
+        // keep it alive across the collect call
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let burner = std::thread::Builder::new()
+            .name("rmon-probe".into())
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                let mut x = 0u64;
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    if start.elapsed() > std::time::Duration::from_secs(5) {
+                        break; // safety valve if the test dies early
+                    }
+                }
+                std::hint::black_box(x);
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut c = MacCollector;
+        let s = c.collect(true).unwrap();
+        let me = std::process::id() as i32;
+        let p = s.procs.iter().find(|p| p.pid == me).unwrap();
+        assert!(p.threads.len() >= 2, "main + probe at minimum");
+        let probe = p.threads.iter().find(|t| t.name == "rmon-probe");
+        let probe = probe.expect("probe thread visible by name");
+        assert!(probe.tid > 0);
+        // ~100ms of burn: >0 proves we read time at all, <10s catches a
+        // ticks-vs-ns units mistake
+        assert!(probe.cpu_ns > 0);
+        assert!(probe.cpu_ns < 10_000_000_000);
+
+        // gating off must mean zero thread work
+        let s = c.collect(false).unwrap();
+        let p = s.procs.iter().find(|p| p.pid == me).unwrap();
+        assert!(p.threads.is_empty());
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        burner.join().unwrap();
     }
 }
