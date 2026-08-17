@@ -76,6 +76,14 @@ pub struct BenchPicker {
     pub selected: usize,
 }
 
+/// modal prompt opened by `k`: confirm before the signal goes out.
+/// pid+name are captured at open time; the list resorts under us every snapshot
+#[derive(Debug, Clone)]
+pub struct KillPrompt {
+    pub pid: i32,
+    pub name: String,
+}
+
 #[derive(Default)]
 pub struct App {
     pub quit: bool,
@@ -97,6 +105,7 @@ pub struct App {
     /// set by the picker; the run loop takes it and spawns the bench thread
     pub bench_target: Option<std::path::PathBuf>,
     pub picker: Option<BenchPicker>,
+    pub confirm_kill: Option<KillPrompt>,
     pub smart: Vec<SmartInfo>,
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
@@ -178,6 +187,18 @@ impl App {
             }
             return;
         }
+        // so is the kill prompt: y/enter sends the signal, anything else backs out
+        if let Some(kp) = &self.confirm_kill {
+            match k.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let kp = kp.clone();
+                    self.confirm_kill = None;
+                    self.kill_proc(&kp);
+                }
+                _ => self.confirm_kill = None,
+            }
+            return;
+        }
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
@@ -205,6 +226,14 @@ impl App {
                     self.open_bench_picker();
                 }
             }
+            KeyCode::Char('k') => {
+                if let Some(p) = self.procs.get(self.selected) {
+                    self.confirm_kill = Some(KillPrompt {
+                        pid: p.pid,
+                        name: p.name.clone(),
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -228,6 +257,16 @@ impl App {
             entries,
             selected: 0,
         });
+    }
+
+    /// SIGTERM, not SIGKILL: give the process a chance to clean up.
+    /// success is silent; the row vanishes on the next snapshot
+    fn kill_proc(&mut self, kp: &KillPrompt) {
+        // SAFETY: plain syscall, no memory involved
+        if unsafe { libc::kill(kp.pid, libc::SIGTERM) } != 0 {
+            let err = std::io::Error::last_os_error();
+            self.status = Some(format!("kill {} ({}) failed: {}", kp.name, kp.pid, err));
+        }
     }
 
     fn apply(&mut self, s: Snapshot) {
@@ -448,6 +487,73 @@ mod tests {
         let mut app = App::default();
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('q'))));
         assert!(app.quit);
+    }
+
+    fn row(pid: i32, name: &str) -> ProcRow {
+        ProcRow {
+            pid,
+            name: name.into(),
+            cpu_pct: 0.0,
+            rss: 0,
+            io_bps: None,
+        }
+    }
+
+    #[test]
+    fn k_opens_kill_prompt_and_any_other_key_backs_out() {
+        let mut app = App::default();
+        // no procs -> no prompt
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('k'))));
+        assert!(app.confirm_kill.is_none());
+
+        app.procs = vec![row(11, "alpha"), row(22, "beta")];
+        app.selected = 1;
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('k'))));
+        let kp = app.confirm_kill.as_ref().expect("prompt opens");
+        assert_eq!((kp.pid, kp.name.as_str()), (22, "beta"));
+
+        // esc backs out without quitting; the prompt swallows the key
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(app.confirm_kill.is_none());
+        assert!(!app.quit, "esc closes the prompt, not the app");
+
+        // any non-confirm key backs out too, and does not reach the sort keys
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('k'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('m'))));
+        assert!(app.confirm_kill.is_none());
+        assert_eq!(app.sort, SortBy::Cpu, "swallowed key must not sort");
+    }
+
+    #[test]
+    fn kill_confirm_signals_the_process() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let mut app = App {
+            procs: vec![row(child.id() as i32, "sleep")],
+            ..App::default()
+        };
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('k'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('y'))));
+        assert!(app.confirm_kill.is_none());
+        let status = child.wait().expect("child reaped");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(app.status.is_none(), "success is silent");
+    }
+
+    #[test]
+    fn kill_failure_sets_status() {
+        // i32::MAX is far past any real pid range -> ESRCH, no signal sent
+        let mut app = App {
+            procs: vec![row(i32::MAX, "ghost")],
+            ..App::default()
+        };
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('k'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Enter)));
+        let st = app.status.as_ref().expect("failure surfaces");
+        assert!(st.contains("ghost") && st.contains("failed"), "{st}");
     }
 
     #[test]

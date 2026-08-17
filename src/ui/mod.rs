@@ -1,3 +1,4 @@
+mod confirm;
 mod cpu;
 mod dsk;
 mod fmt;
@@ -26,6 +27,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     mem::draw(f, app, mem_area);
     if let Some(p) = &app.picker {
         picker::draw(f, p, f.area());
+    }
+    if let Some(kp) = &app.confirm_kill {
+        confirm::draw(f, kp, f.area());
     }
 }
 
@@ -104,6 +108,16 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
                 }
             }
             _ => {}
+        }
+        return;
+    }
+    // the kill prompt is modal too: a click outside backs out, everything
+    // else is keyboard-only so a stray click cannot confirm a kill
+    if let Some(kp) = &app.confirm_kill {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind
+            && !confirm::popup_rect(frame, kp).contains(Position::new(m.column, m.row))
+        {
+            app.confirm_kill = None;
         }
         return;
     }
@@ -349,6 +363,39 @@ mod tests {
             })
             .collect();
         app
+    }
+
+    #[test]
+    fn kill_prompt_swallows_mouse_and_click_outside_closes() {
+        let mut app = overflowing_app();
+        let frame = Rect::new(0, 0, 80, 40);
+        app.confirm_kill = Some(crate::app::KillPrompt {
+            pid: 1,
+            name: "p1".into(),
+        });
+        let area = confirm::popup_rect(frame, app.confirm_kill.as_ref().unwrap());
+        // wheel must not scroll the list behind the modal
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 2, 2), frame);
+        assert_eq!(app.selected, 0);
+        // a click inside is inert: only y/enter may confirm
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 1,
+                area.y + 1,
+            ),
+            frame,
+        );
+        assert!(app.confirm_kill.is_some());
+        // a click outside backs out
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            frame,
+        );
+        assert!(app.confirm_kill.is_none());
+        assert_eq!(app.selected, 0, "the closing click must not select a row");
     }
 
     #[test]

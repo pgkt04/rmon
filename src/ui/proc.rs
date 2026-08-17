@@ -22,7 +22,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(theme::TITLE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{} procs, sort {sort} [c/m/i] ", app.procs.len()),
+            format!("{} procs, sort {sort} [c/m/i] [k]ill ", app.procs.len()),
             Style::new().fg(theme::LABEL),
         ),
     ]);
