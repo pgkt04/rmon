@@ -10,7 +10,7 @@ use super::fmt::{humanize, rate};
 use super::theme;
 use crate::app::{App, SortBy};
 
-pub fn draw(f: &mut Frame, app: &App, area: Rect) {
+pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let sort = match app.sort {
         SortBy::Cpu => "cpu",
         SortBy::Mem => "mem",
@@ -61,7 +61,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     ))];
 
     let visible = inner.height as usize - 1;
-    let offset = app.selected.saturating_sub(visible.saturating_sub(1));
+    let offset = app.scroll_viewport(visible);
     for (i, p) in app.procs.iter().enumerate().skip(offset).take(visible) {
         let thread = p.tid.is_some();
         let mut name = if thread {

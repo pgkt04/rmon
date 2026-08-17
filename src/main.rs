@@ -111,7 +111,7 @@ fn run(
 ) -> Result<()> {
     let mut app = App::default();
     while !app.quit {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
         match rx.recv() {
             Ok(AppEvent::Mouse(m)) => {
                 let size = terminal.size()?;

@@ -108,6 +108,8 @@ pub struct App {
     /// (pid, tid) under the highlight; the list resorts every snapshot, so
     /// the index alone would make the selection wander. tid None = process row
     pub selected_id: Option<(i32, Option<u64>)>,
+    /// first row the proc panel shows; owned here so draw and mouse agree
+    pub view_offset: usize,
     /// true while the mouse is dragging the proc scrollbar thumb
     pub drag_scroll: bool,
     pub sort: SortBy,
@@ -568,6 +570,20 @@ impl App {
     pub fn select(&mut self, idx: usize) {
         self.selected = idx;
         self.selected_id = self.procs.get(idx).map(|p| (p.pid, p.tid));
+    }
+
+    /// first visible row; draw clamps it each frame and the mouse handler
+    /// maps clicks through it, so clicks hit what was actually on screen
+    pub fn scroll_viewport(&mut self, visible: usize) -> usize {
+        let last = self.procs.len().saturating_sub(1);
+        self.view_offset = self.view_offset.min(last);
+        // follow the selection only when it walks off the window
+        if self.selected < self.view_offset {
+            self.view_offset = self.selected;
+        } else if visible > 0 && self.selected >= self.view_offset + visible {
+            self.view_offset = self.selected + 1 - visible;
+        }
+        self.view_offset
     }
 
     /// after a resort, chase the anchored row to its new index. a dead row
@@ -1417,5 +1433,27 @@ mod tests {
         key(&mut app, KeyCode::Char('t'));
         assert!(!app.show_threads);
         assert_eq!(app.filter, "t");
+    }
+
+    #[test]
+    fn viewport_follows_selection_only_off_window() {
+        let mut app = App {
+            procs: (0..100).map(|i| row(i, "p")).collect(),
+            ..App::default()
+        };
+        // selection inside the window: the view stays put
+        app.view_offset = 10;
+        app.selected = 15;
+        assert_eq!(app.scroll_viewport(20), 10);
+        // below the window: scroll just enough to show it
+        app.selected = 40;
+        assert_eq!(app.scroll_viewport(20), 21);
+        // above the window: snap to it
+        app.selected = 5;
+        assert_eq!(app.scroll_viewport(20), 5);
+        // list shrank under the offset: clamp
+        app.procs.truncate(3);
+        app.selected = 2;
+        assert_eq!(app.scroll_viewport(20), 2);
     }
 }

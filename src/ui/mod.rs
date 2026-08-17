@@ -18,7 +18,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 
 use crate::app::App;
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let [cpu_area, net_area, dsk_area, proc_area, mem_area] = panels(f.area(), app);
     cpu::draw(f, app, cpu_area);
     net::draw(f, app, net_area);
@@ -157,9 +157,10 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
             if m.row < first_row_y || m.row + 1 >= proc_area.y + proc_area.height {
                 return;
             }
-            let visible = (proc_area.height as usize).saturating_sub(3);
-            let offset = app.selected.saturating_sub(visible.saturating_sub(1));
-            let idx = offset + (m.row - first_row_y) as usize;
+            // map through the offset the last frame actually drew, not a
+            // recomputed one: the list churns every snapshot and a derived
+            // offset can disagree with what the user was aiming at
+            let idx = app.view_offset + (m.row - first_row_y) as usize;
             if idx < app.procs.len() {
                 app.select(idx);
             }
@@ -262,8 +263,8 @@ mod tests {
         // wide enough that the dsk rows (45% of the band) show every segment
         let backend = TestBackend::new(190, 46);
         let mut term = Terminal::new(backend).unwrap();
-        let app = fake_app();
-        term.draw(|f| draw(f, &app)).unwrap();
+        let mut app = fake_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains(" cpu "));
         assert!(text.contains("c00"));
@@ -351,6 +352,26 @@ mod tests {
             frame,
         );
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn click_maps_through_the_drawn_offset_not_the_selection() {
+        let mut app = overflowing_app();
+        let frame = Rect::new(0, 0, 80, 40);
+        let [_, _, _, proc_area, _] = panels(frame, &app);
+        // the last frame drew rows 10.. while the selection sits deep at 50
+        app.selected = 50;
+        app.view_offset = 10;
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                proc_area.x + 2,
+                proc_area.y + 2,
+            ),
+            frame,
+        );
+        assert_eq!(app.selected, 10, "first visible row is what was clicked");
     }
 
     /// enough procs that the proc panel scrolls at any sane frame size
@@ -549,8 +570,8 @@ mod tests {
     fn cpu_title_shows_identity_and_gpu_meter() {
         let backend = TestBackend::new(100, 46);
         let mut term = Terminal::new(backend).unwrap();
-        let app = fake_app();
-        term.draw(|f| draw(f, &app)).unwrap();
+        let mut app = fake_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(&term);
         let title_row = text.lines().next().unwrap();
         assert!(title_row.contains("Apple M1 Pro"), "{title_row}");
@@ -575,7 +596,7 @@ mod tests {
         app.gpu_util_pct = None;
         app.load_avg = None;
         app.uptime_secs = None;
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains(" cpu "));
         assert!(!text.contains("°C"));
@@ -609,7 +630,7 @@ mod tests {
                 last_child: false,
             })
             .collect();
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let [_, _, _, proc_area, _] = panels(Rect::new(0, 0, 100, 46), &app);
         let col = proc_right_column(&term, proc_area);
         assert!(col.iter().any(|s| s == "█"), "no thumb: {col:?}");
@@ -617,7 +638,7 @@ mod tests {
         assert_eq!(col.first().map(String::as_str), Some("█"), "{col:?}");
 
         app.selected = app.procs.len() - 1;
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let col = proc_right_column(&term, proc_area);
         assert_eq!(col.last().map(String::as_str), Some("█"), "{col:?}");
         assert_ne!(col.first().map(String::as_str), Some("█"), "{col:?}");
@@ -627,8 +648,8 @@ mod tests {
     fn proc_scrollbar_absent_when_list_fits() {
         let backend = TestBackend::new(100, 46);
         let mut term = Terminal::new(backend).unwrap();
-        let app = fake_app(); // two procs, plenty of rows
-        term.draw(|f| draw(f, &app)).unwrap();
+        let mut app = fake_app(); // two procs, plenty of rows
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let [_, _, _, proc_area, _] = panels(Rect::new(0, 0, 100, 46), &app);
         let col = proc_right_column(&term, proc_area);
         assert!(col.iter().all(|s| s != "█" && s != "░"), "{col:?}");
@@ -657,7 +678,7 @@ mod picker_tests {
         let mut app = fake_app();
         app.bench = None; // fake_app has a running bench; clear so b opens the picker
         open_picker(&mut app);
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let text: String = {
             let buf = term.backend().buffer();
             (0..buf.area.height)
