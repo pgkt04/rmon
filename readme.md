@@ -39,9 +39,11 @@ keys:
     up/down     move selection
     c/m/i/n     sort procs by cpu, memory, io, name
     f or /      filter procs (enter keeps it, esc clears it)
-    t           show threads under each process
+    t           show threads of the selected process
     e           process tree view
     h           show idle interfaces and disks
     k           kill selected process (y/enter confirms)
     b           run disk benchmark
+    s           system info popup (neofetch style)
+    + / -       slow down / speed up the refresh (100ms..10s)
     mouse       wheel scrolls, click selects, scrollbars drag
