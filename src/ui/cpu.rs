@@ -40,6 +40,21 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(theme::LABEL),
         ));
     }
+    // current refresh cadence, so +/- has visible feedback
+    let upd = app.refresh_ms();
+    let upd = if upd >= 1000 {
+        format!("upd {:.1}s ", upd as f64 / 1000.0)
+    } else {
+        format!("upd {upd}ms ")
+    };
+    title.push(Span::styled(
+        upd,
+        Style::new().fg(theme::LABEL).add_modifier(Modifier::DIM),
+    ));
+    title.push(Span::styled(
+        "[+/-] [s]ys ",
+        Style::new().fg(theme::LABEL).add_modifier(Modifier::DIM),
+    ));
     let title = Line::from(title);
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)

@@ -1,6 +1,7 @@
 mod confirm;
 mod cpu;
 mod dsk;
+mod fetch;
 mod fmt;
 mod graph;
 mod mem;
@@ -30,6 +31,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some(kp) = &app.confirm_kill {
         confirm::draw(f, kp, f.area());
+    }
+    if let Some(fi) = &app.fetch {
+        fetch::draw(f, app, fi, f.area());
     }
 }
 
@@ -158,6 +162,16 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
             && !confirm::popup_rect(frame, kp).contains(Position::new(m.column, m.row))
         {
             app.confirm_kill = None;
+        }
+        return;
+    }
+    // the fetch popup is inert: a click outside closes it, everything else
+    // (clicks inside, wheel, drags) is swallowed so the panels stay put
+    if let Some(fi) = &app.fetch {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind
+            && !fetch::popup_rect(frame, fi).contains(Position::new(m.column, m.row))
+        {
+            app.fetch = None;
         }
         return;
     }
@@ -977,5 +991,85 @@ mod picker_tests {
         handle_mouse(&mut app, click, frame);
         assert!(app.picker.is_none());
         assert!(app.bench_target.is_none());
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::tests::fake_app;
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    fn open_fetch(app: &mut App) {
+        app.on_event(crate::app::AppEvent::Key(KeyEvent::from(KeyCode::Char(
+            's',
+        ))));
+        assert!(app.fetch.is_some());
+    }
+
+    #[test]
+    fn fetch_popup_renders_logo_and_labels_over_panels() {
+        let backend = TestBackend::new(100, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        open_fetch(&mut app);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text: String = {
+            let buf = term.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text.contains(" system "), "popup title renders");
+        let first = app.fetch.as_ref().unwrap().logo[0].trim();
+        assert!(text.contains(first), "logo's first row renders");
+        assert!(text.contains("kernel: "), "static info rows render");
+        // live rows come off App, not FetchInfo
+        assert!(text.contains("cpu: "), "live cpu row renders");
+        assert!(text.contains("memory: "), "live memory row renders");
+    }
+
+    #[test]
+    fn fetch_popup_swallows_mouse_and_click_outside_closes() {
+        let frame = Rect::new(0, 0, 100, 46);
+        let mut app = fake_app();
+        open_fetch(&mut app);
+        let area = fetch::popup_rect(frame, app.fetch.as_ref().unwrap());
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        // wheel must not scroll the list behind the modal
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 2, 30), frame);
+        assert_eq!(app.selected, 0);
+        assert!(app.fetch.is_some());
+        // a click inside is inert
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 1,
+                area.y + 1,
+            ),
+            frame,
+        );
+        assert!(app.fetch.is_some());
+        // a click outside closes without touching the panels underneath
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            frame,
+        );
+        assert!(app.fetch.is_none());
+        assert_eq!(app.selected, 0, "the closing click must not select a row");
     }
 }

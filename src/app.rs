@@ -148,6 +148,8 @@ pub struct App {
     pub bench_target: Option<std::path::PathBuf>,
     pub picker: Option<BenchPicker>,
     pub confirm_kill: Option<KillPrompt>,
+    /// `s`: neofetch-style system info popup; Some while it's on screen
+    pub fetch: Option<crate::fetch::FetchInfo>,
     /// live substring filter for the proc list; empty = off
     pub filter: String,
     /// true while `f` captures keystrokes into the filter
@@ -156,8 +158,11 @@ pub struct App {
     pub show_threads: bool,
     /// `e`: arrange procs as a ppid tree, btop style
     pub tree: bool,
+    /// snapshot cadence in ms, +/- adjusts; derive(Default) leaves it 0,
+    /// so always read through refresh_ms()
+    pub update_ms: u64,
     /// thread rows keyed by owning pid, rebuilt every snapshot; refilter
-    /// weaves them into `procs` when show_threads is on
+    /// weaves the selected process's rows into `procs` when show_threads is on
     threads_by_pid: HashMap<i32, Vec<ProcRow>>,
     pub smart: Vec<SmartInfo>,
     pub cpu_name: Option<String>,
@@ -240,7 +245,8 @@ struct TreeWalk<'a> {
     procs: &'a [ProcRow],
     children: &'a HashMap<i32, Vec<usize>>,
     threads: &'a HashMap<i32, Vec<ProcRow>>,
-    show_threads: bool,
+    /// pid whose threads render; None while t is off or nothing is selected
+    threads_for: Option<i32>,
     sort: SortBy,
     seen: HashSet<i32>,
     out: Vec<ProcRow>,
@@ -271,7 +277,9 @@ impl TreeWalk<'_> {
                 .filter(|&c| !self.seen.contains(&self.procs[c].pid))
                 .collect()
         });
-        let mut ts = if self.show_threads {
+        // only the selected proc shows threads; the map can still hold stale
+        // rows from a previous selection, never render those
+        let mut ts = if Some(pid) == self.threads_for {
             self.threads.get(&pid).cloned().unwrap_or_default()
         } else {
             Vec::new()
@@ -328,6 +336,15 @@ impl App {
         }
     }
 
+    /// update_ms with the Default-derived 0 normalized to the stock 1s tick
+    pub fn refresh_ms(&self) -> u64 {
+        if self.update_ms == 0 {
+            1000
+        } else {
+            self.update_ms
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         // raw mode turns ctrl+c into a plain key event; honor it from anywhere
         if k.code == KeyCode::Char('c')
@@ -364,6 +381,14 @@ impl App {
                     self.kill_proc(&kp);
                 }
                 _ => self.confirm_kill = None,
+            }
+            return;
+        }
+        // the fetch popup is read-only: esc/q/s close it, the rest bounces off
+        if self.fetch.is_some() {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.fetch = None,
+                _ => {}
             }
             return;
         }
@@ -433,6 +458,15 @@ impl App {
                 self.refilter();
             }
             KeyCode::Char('h') => self.show_idle = !self.show_idle,
+            // btop-style: + slows the refresh, - speeds it up. = shares
+            // the + key on most layouts, take it unshifted too
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.update_ms = (self.refresh_ms() + 100).min(10_000);
+            }
+            KeyCode::Char('-') => {
+                self.update_ms = self.refresh_ms().saturating_sub(100).max(100);
+            }
+            KeyCode::Char('s') => self.fetch = Some(crate::fetch::collect()),
             KeyCode::Char('b') => {
                 let running = self
                     .bench
@@ -730,11 +764,17 @@ impl App {
         if !self.show_threads {
             return;
         }
+        // only the selected process grows thread rows; a selected thread row
+        // counts as its parent (the anchor pid is the parent pid already)
+        let sel = self.selected_pid();
         let parents = std::mem::take(&mut self.procs);
         let mut out = Vec::with_capacity(parents.len());
         for p in parents {
             let pid = p.pid;
             out.push(p);
+            if Some(pid) != sel {
+                continue;
+            }
             let Some(ts) = self.threads_by_pid.get(&pid) else {
                 continue;
             };
@@ -773,7 +813,11 @@ impl App {
             procs: &procs,
             children: &children,
             threads: &self.threads_by_pid,
-            show_threads: self.show_threads,
+            threads_for: if self.show_threads {
+                self.selected_pid()
+            } else {
+                None
+            },
             sort: self.sort,
             seen: HashSet::with_capacity(procs.len()),
             out: Vec::with_capacity(procs.len()),
@@ -815,6 +859,12 @@ impl App {
     pub fn select(&mut self, idx: usize) {
         self.selected = idx;
         self.selected_id = self.procs.get(idx).map(|p| (p.pid, p.tid));
+    }
+
+    /// pid whose threads should render: the selection's pid. a thread row's
+    /// anchor pid is its parent pid already, so no translation needed
+    fn selected_pid(&self) -> Option<i32> {
+        self.selected_id.map(|(pid, _)| pid)
     }
 
     /// net rows the h toggle lets through, panel order preserved
@@ -1010,6 +1060,46 @@ mod tests {
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('m'))));
         assert!(app.confirm_kill.is_none());
         assert_eq!(app.sort, SortBy::Cpu, "swallowed key must not sort");
+    }
+
+    #[test]
+    fn s_opens_fetch_popup_and_it_swallows_keys() {
+        let mut app = App::default();
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        assert!(app.fetch.is_some(), "s opens the popup");
+
+        // sort keys bounce off while it's open
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('m'))));
+        assert!(app.fetch.is_some());
+        assert_eq!(app.sort, SortBy::Cpu, "swallowed key must not sort");
+
+        // esc closes the popup, not the app
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(app.fetch.is_none());
+        assert!(!app.quit, "esc closes the popup, not the app");
+
+        // q closes it too without quitting
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('q'))));
+        assert!(app.fetch.is_none());
+        assert!(!app.quit, "q inside the popup must not quit");
+
+        // s toggles it shut as well
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        assert!(app.fetch.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_quits_through_the_fetch_popup() {
+        let mut app = App::default();
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        assert!(app.fetch.is_some());
+        app.on_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        )));
+        assert!(app.quit, "ctrl-c must quit from anywhere");
     }
 
     #[test]
@@ -1679,6 +1769,8 @@ mod tests {
         let mut app = App::default();
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         assert_eq!(app.procs.len(), 2, "threads hidden until toggled");
 
@@ -1709,6 +1801,8 @@ mod tests {
         key(&mut app, KeyCode::Char('t'));
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         // worker burned 300ms in 1s, the unnamed thread 100ms
         let worker = app.procs.iter().find(|p| p.tid == Some(10)).unwrap();
@@ -1724,6 +1818,8 @@ mod tests {
         let (a, b) = thread_pair();
         let base = a.taken;
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         // [alpha, worker, tid 11, beta]; anchor on worker
         key(&mut app, KeyCode::Down);
@@ -1772,6 +1868,8 @@ mod tests {
         key(&mut app, KeyCode::Char('t'));
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         // move onto worker (a thread of alpha) and hit k
         key(&mut app, KeyCode::Down);
@@ -1788,6 +1886,8 @@ mod tests {
         key(&mut app, KeyCode::Char('t'));
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
 
         // alpha filtered out -> its threads go with it
@@ -1807,6 +1907,30 @@ mod tests {
         }
         let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
         assert_eq!(ids, [(1, None), (1, Some(10)), (1, Some(11))]);
+    }
+
+    #[test]
+    fn threads_render_only_under_the_selected_process() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('t'));
+        let (a, b) = thread_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        // park the highlight on beta; alpha's rows land in threads_by_pid
+        // but must not render under a de-selected proc
+        app.selected_id = Some((2, None));
+        app.on_event(AppEvent::Snapshot(b));
+        assert!(app.threads_by_pid.contains_key(&1), "rows were collected");
+        assert!(
+            app.procs.iter().all(|p| p.tid.is_none()),
+            "no thread rows for a non-selected proc"
+        );
+
+        // moving the selection onto alpha and reweaving brings them out
+        let idx = app.procs.iter().position(|p| p.pid == 1).unwrap();
+        app.select(idx);
+        app.refilter();
+        let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
+        assert_eq!(ids, [(1, None), (1, Some(10)), (1, Some(11)), (2, None)]);
     }
 
     #[test]
@@ -1979,6 +2103,8 @@ mod tests {
             pproc(4, 2, "four", 200_000_000),
         ];
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on 2 first
+        app.selected_id = Some((2, None));
         app.on_event(AppEvent::Snapshot(b));
         let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
         // threads of 2 come first (cpu desc), then its child proc 4
@@ -2077,5 +2203,37 @@ mod tests {
         app.reanchor();
         assert_eq!(app.selected, 2);
         assert_eq!(app.view_offset, 0, "cannot scroll above the first row");
+    }
+
+    #[test]
+    fn refresh_interval_defaults_and_clamps() {
+        let mut app = App::default();
+        assert_eq!(app.refresh_ms(), 1000, "derive(Default) 0 reads as 1s");
+
+        // + slows the refresh, btop style; = is the same physical key
+        key(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.refresh_ms(), 1100);
+        key(&mut app, KeyCode::Char('='));
+        assert_eq!(app.refresh_ms(), 1200);
+        app.update_ms = 10_000;
+        key(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.refresh_ms(), 10_000, "clamped at 10s");
+
+        // - speeds it up, floor at 100ms
+        app.update_ms = 200;
+        key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.refresh_ms(), 100);
+        key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.refresh_ms(), 100, "clamped at 100ms");
+    }
+
+    #[test]
+    fn plus_minus_while_filter_editing_is_text_not_interval() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Char('+'));
+        key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.filter, "+-");
+        assert_eq!(app.refresh_ms(), 1000, "interval untouched");
     }
 }

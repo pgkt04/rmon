@@ -108,8 +108,8 @@ pub struct ProcessInfo {
     /// None when the process is not ours to inspect
     pub disk_read: Option<u64>,
     pub disk_written: Option<u64>,
-    /// per-thread breakdown; only filled when the caller asked for it
-    /// (it costs a pile of extra syscalls), empty on per-process errors too
+    /// per-thread breakdown; only filled for the single pid the caller asked
+    /// about (it costs a pile of extra syscalls), empty on per-process errors too
     pub threads: Vec<ThreadInfo>,
 }
 
@@ -155,9 +155,9 @@ impl Default for Snapshot {
 }
 
 pub trait Collector: Send {
-    /// `threads`: also collect per-thread info; skipped when false because
-    /// it's hundreds of extra file reads/syscalls per tick
-    fn collect(&mut self, threads: bool) -> Result<Snapshot, CollectError>;
+    /// `threads_for`: pid whose per-thread info to also collect; None skips
+    /// thread work entirely because it's hundreds of extra file reads/syscalls
+    fn collect(&mut self, threads_for: Option<i32>) -> Result<Snapshot, CollectError>;
 }
 
 /// 1/5/15 minute load averages; same libc call on linux and macos

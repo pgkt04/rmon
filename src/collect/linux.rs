@@ -415,7 +415,7 @@ pub struct LinuxCollector;
 
 #[cfg(target_os = "linux")]
 impl Collector for LinuxCollector {
-    fn collect(&mut self, threads: bool) -> Result<Snapshot, CollectError> {
+    fn collect(&mut self, threads_for: Option<i32>) -> Result<Snapshot, CollectError> {
         let cpu = parse_proc_stat(&std::fs::read_to_string("/proc/stat")?)?;
         let mem = parse_meminfo(&std::fs::read_to_string("/proc/meminfo")?)?;
         let net = parse_net_dev(&std::fs::read_to_string("/proc/net/dev")?);
@@ -443,8 +443,9 @@ impl Collector for LinuxCollector {
                     p.disk_read = Some(r);
                     p.disk_written = Some(w);
                 }
-                // opt-in: this is one dir listing + a file per thread, per tick
-                if threads {
+                // opt-in: one dir listing + a file per thread, so only the
+                // single pid the ui actually selected pays for it
+                if threads_for == Some(pid) {
                     p.threads = read_task_threads(&entry.path().join("task"), clk_tck);
                 }
                 procs.push(p);
