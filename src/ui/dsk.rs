@@ -62,15 +62,23 @@ pub(super) fn bench_rows(b: &BenchState, width: u16) -> usize {
     usize::from(b.running.is_some() || b.error.is_some()) + bench_lines(b, width).len()
 }
 
-pub fn draw(f: &mut Frame, app: &App, area: Rect) {
+pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let io_now = app.disk_io.back().copied().unwrap_or(0.0);
+    let hidden = app.disks.len() - app.visible_disks().len();
     let title = Line::from(vec![
         Span::styled(
             " dsk ",
             Style::new().fg(theme::TITLE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("io {} ", rate(io_now)), Style::new().fg(IO)),
-        Span::styled("[b]ench ", Style::new().fg(theme::LABEL)),
+        Span::styled(
+            if hidden > 0 {
+                format!("[b]ench +{hidden} idle ")
+            } else {
+                "[b]ench ".to_string()
+            },
+            Style::new().fg(theme::LABEL),
+        ),
     ]);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -91,9 +99,15 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let disk_budget = (inner.height as usize)
         .saturating_sub(app.mounts.len() + app.smart.len() + benched)
         .max(usize::from(!app.disks.is_empty()));
+    // the h toggle decides which disks earn a row; the viewport scrolls them
+    app.dsk_rows_cap = disk_budget;
+    let n_vis = app.visible_disks().len();
+    app.dsk_offset = app.dsk_offset.min(n_vis.saturating_sub(disk_budget));
+    let offset = app.dsk_offset;
+    let disks = app.visible_disks();
     // segments drop off as the panel narrows instead of clipping mid-number
     let w = rows_width as usize;
-    for d in app.disks.iter().take(disk_budget) {
+    for d in disks.iter().skip(offset).take(disk_budget) {
         let mut spans = vec![
             Span::styled(format!("{:<8}", d.name), Style::new().fg(theme::TITLE)),
             Span::styled(
@@ -194,6 +208,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             )));
         }
     }
+    if let Some(track) = super::rows_scrollbar(area, inner.y, disk_budget, disks.len()) {
+        super::draw_scrollbar(f, track, disks.len(), offset);
+    }
     // rows sit on top; the aggregate io graph gets every leftover row below,
     // at full width - a tall skinny side column reads as noise
     let used = (lines.len() as u16).min(inner.height);
@@ -229,7 +246,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn render(width: u16, height: u16, app: &App) -> String {
+    fn render(width: u16, height: u16, app: &mut App) -> String {
         let backend = TestBackend::new(width, height);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app, f.area())).unwrap();
@@ -259,7 +276,7 @@ mod tests {
     fn smart_row_renders() {
         let mut app = App::default();
         app.smart = vec![smart_disk0(true)];
-        let text = render(90, 8, &app);
+        let text = render(90, 8, &mut app);
         assert!(text.contains("APPLE SSD"), "missing model: {text}");
         assert!(text.contains("31°C"), "missing temp: {text}");
         assert!(text.contains("ok"), "missing health: {text}");
@@ -269,7 +286,7 @@ mod tests {
     fn unhealthy_is_marked() {
         let mut app = App::default();
         app.smart = vec![smart_disk0(false)];
-        let text = render(90, 8, &app);
+        let text = render(90, 8, &mut app);
         assert!(text.contains("FAIL"), "missing FAIL: {text}");
     }
 
@@ -295,7 +312,7 @@ mod tests {
             direct: Some(false),
         });
         // 60 wide -> ~35-col rows column: the joined line cannot fit, must wrap
-        let text = render(60, 10, &app);
+        let text = render(60, 10, &mut app);
         for label in ["seq write", "seq read", "rand read", "rand write"] {
             assert!(text.contains(label), "missing {label}: {text}");
         }

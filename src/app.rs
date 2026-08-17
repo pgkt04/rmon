@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 
@@ -9,6 +10,9 @@ use crate::smart::SmartInfo;
 // braille packs 2 samples per char column: 720 samples fill a 360-col
 // terminal; 300 could never reach the left edge past 150 chars
 pub const HISTORY: usize = 720;
+
+/// a net/dsk row idle this long stops rendering unless `h` shows it
+pub const IDLE_HIDE_SECS: f64 = 5.0;
 
 pub enum AppEvent {
     Snapshot(Box<Snapshot>),
@@ -57,6 +61,18 @@ pub struct DiskRow {
     pub util_pct: Option<f64>,
     pub queue: Option<f64>,
     pub lat_ms: Option<f64>,
+    /// seconds since the device last moved a byte; drives the h toggle
+    pub idle_secs: f64,
+}
+
+/// one physical interface with its live rx/tx rates
+#[derive(Debug, Clone)]
+pub struct NetRow {
+    pub name: String,
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+    /// seconds since the interface last moved a byte; drives the h toggle
+    pub idle_secs: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,6 +130,17 @@ pub struct App {
     pub view_offset: usize,
     /// true while the mouse is dragging the proc scrollbar thumb
     pub drag_scroll: bool,
+    /// `h` flips this: false (default) hides net/dsk rows idle > 5s
+    pub show_idle: bool,
+    /// net and dsk row viewports; draw clamps them and records the row
+    /// capacity so the mouse maps against what was actually on screen
+    pub net_offset: usize,
+    pub dsk_offset: usize,
+    pub net_rows_cap: usize,
+    pub dsk_rows_cap: usize,
+    /// scrollbar drags in flight on the net / dsk row lists
+    pub drag_net: bool,
+    pub drag_dsk: bool,
     pub sort: SortBy,
     pub status: Option<String>,
     pub bench: Option<BenchState>,
@@ -121,6 +148,8 @@ pub struct App {
     pub bench_target: Option<std::path::PathBuf>,
     pub picker: Option<BenchPicker>,
     pub confirm_kill: Option<KillPrompt>,
+    /// `s`: neofetch-style system info popup; Some while it's on screen
+    pub fetch: Option<crate::fetch::FetchInfo>,
     /// live substring filter for the proc list; empty = off
     pub filter: String,
     /// true while `f` captures keystrokes into the filter
@@ -129,8 +158,11 @@ pub struct App {
     pub show_threads: bool,
     /// `e`: arrange procs as a ppid tree, btop style
     pub tree: bool,
+    /// snapshot cadence in ms, +/- adjusts; derive(Default) leaves it 0,
+    /// so always read through refresh_ms()
+    pub update_ms: u64,
     /// thread rows keyed by owning pid, rebuilt every snapshot; refilter
-    /// weaves them into `procs` when show_threads is on
+    /// weaves the selected process's rows into `procs` when show_threads is on
     threads_by_pid: HashMap<i32, Vec<ProcRow>>,
     pub smart: Vec<SmartInfo>,
     pub cpu_name: Option<String>,
@@ -138,9 +170,17 @@ pub struct App {
     pub core_temps_c: Vec<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
+    /// gpu utilization history, HISTORY-capped; empty on hosts with no gpu
+    pub gpu_hist: VecDeque<f64>,
     pub load_avg: Option<[f64; 3]>,
     pub uptime_secs: Option<u64>,
-    pub net_iface: Option<String>,
+    pub net_ifaces: Vec<NetRow>,
+    /// per-interface rate history keyed by name: (rx, tx), HISTORY-capped;
+    /// vanished interfaces are pruned so hotplug churn cannot leak
+    pub net_hist: HashMap<String, (VecDeque<f64>, VecDeque<f64>)>,
+    /// last instant each interface / disk moved a byte, for the h toggle
+    net_last_active: HashMap<String, Instant>,
+    disk_last_active: HashMap<String, Instant>,
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     prev: Option<Snapshot>,
@@ -151,6 +191,29 @@ fn push_capped(hist: &mut VecDeque<f64>, v: f64) {
     if hist.len() > HISTORY {
         hist.pop_front();
     }
+}
+
+/// seconds since `name` last moved a byte. never-active devices are born
+/// past the grace period so they start hidden; active ones reset to zero
+fn idle_secs(
+    map: &mut HashMap<String, Instant>,
+    name: &str,
+    now: Instant,
+    active_now: bool,
+    ever_active: bool,
+) -> f64 {
+    let seen = map.entry(name.to_owned()).or_insert_with(|| {
+        if ever_active {
+            now
+        } else {
+            now.checked_sub(std::time::Duration::from_secs_f64(IDLE_HIDE_SECS + 1.0))
+                .unwrap_or(now)
+        }
+    });
+    if active_now {
+        *seen = now;
+    }
+    now.duration_since(*seen).as_secs_f64()
 }
 
 /// one comparator shared by flat and tree mode so sibling order matches the list
@@ -184,7 +247,8 @@ struct TreeWalk<'a> {
     procs: &'a [ProcRow],
     children: &'a HashMap<i32, Vec<usize>>,
     threads: &'a HashMap<i32, Vec<ProcRow>>,
-    show_threads: bool,
+    /// pid whose threads render; None while t is off or nothing is selected
+    threads_for: Option<i32>,
     sort: SortBy,
     seen: HashSet<i32>,
     out: Vec<ProcRow>,
@@ -215,7 +279,9 @@ impl TreeWalk<'_> {
                 .filter(|&c| !self.seen.contains(&self.procs[c].pid))
                 .collect()
         });
-        let mut ts = if self.show_threads {
+        // only the selected proc shows threads; the map can still hold stale
+        // rows from a previous selection, never render those
+        let mut ts = if Some(pid) == self.threads_for {
             self.threads.get(&pid).cloned().unwrap_or_default()
         } else {
             Vec::new()
@@ -272,6 +338,15 @@ impl App {
         }
     }
 
+    /// update_ms with the Default-derived 0 normalized to the stock 1s tick
+    pub fn refresh_ms(&self) -> u64 {
+        if self.update_ms == 0 {
+            1000
+        } else {
+            self.update_ms
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         // raw mode turns ctrl+c into a plain key event; honor it from anywhere
         if k.code == KeyCode::Char('c')
@@ -308,6 +383,14 @@ impl App {
                     self.kill_proc(&kp);
                 }
                 _ => self.confirm_kill = None,
+            }
+            return;
+        }
+        // the fetch popup is read-only: esc/q/s close it, the rest bounces off
+        if self.fetch.is_some() {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.fetch = None,
+                _ => {}
             }
             return;
         }
@@ -376,6 +459,16 @@ impl App {
                 self.tree = !self.tree;
                 self.refilter();
             }
+            KeyCode::Char('h') => self.show_idle = !self.show_idle,
+            // btop-style: + slows the refresh, - speeds it up. = shares
+            // the + key on most layouts, take it unshifted too
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.update_ms = (self.refresh_ms() + 100).min(10_000);
+            }
+            KeyCode::Char('-') => {
+                self.update_ms = self.refresh_ms().saturating_sub(100).max(100);
+            }
+            KeyCode::Char('s') => self.fetch = Some(crate::fetch::collect()),
             KeyCode::Char('b') => {
                 let running = self
                     .bench
@@ -459,6 +552,52 @@ impl App {
                 &mut self.net_tx,
                 s.net.tx_bytes.saturating_sub(prev.net.tx_bytes) as f64 / dt,
             );
+
+            let prev_ifaces: HashMap<&str, &crate::collect::NetIface> = prev
+                .net
+                .interfaces
+                .iter()
+                .map(|i| (i.name.as_str(), i))
+                .collect();
+            // every interface earns a row (h hides the idle ones), busiest
+            // lifetime traffic first so the live nic tops the list
+            let mut lively: Vec<&crate::collect::NetIface> = s.net.interfaces.iter().collect();
+            lively.sort_by_key(|i| std::cmp::Reverse(i.rx_bytes + i.tx_bytes));
+            self.net_ifaces = lively
+                .iter()
+                .map(|i| {
+                    let p = prev_ifaces.get(i.name.as_str());
+                    let rx_bps = p
+                        .map(|q| i.rx_bytes.saturating_sub(q.rx_bytes) as f64 / dt)
+                        .unwrap_or(0.0);
+                    let tx_bps = p
+                        .map(|q| i.tx_bytes.saturating_sub(q.tx_bytes) as f64 / dt)
+                        .unwrap_or(0.0);
+                    let (rx_h, tx_h) = self.net_hist.entry(i.name.clone()).or_default();
+                    push_capped(rx_h, rx_bps);
+                    push_capped(tx_h, tx_bps);
+                    let idle_secs = idle_secs(
+                        &mut self.net_last_active,
+                        &i.name,
+                        s.taken,
+                        rx_bps > 0.0 || tx_bps > 0.0,
+                        // every iface starts hidden — even ones with lifetime
+                        // traffic — so startup does not flash the whole list;
+                        // a row earns its spot with a live byte
+                        false,
+                    );
+                    NetRow {
+                        name: i.name.clone(),
+                        rx_bps,
+                        tx_bps,
+                        idle_secs,
+                    }
+                })
+                .collect();
+            self.net_hist
+                .retain(|name, _| s.net.interfaces.iter().any(|i| &i.name == name));
+            self.net_last_active
+                .retain(|name, _| s.net.interfaces.iter().any(|i| &i.name == name));
 
             let prev_by_pid: HashMap<i32, &crate::collect::ProcessInfo> =
                 prev.procs.iter().map(|p| (p.pid, p)).collect();
@@ -548,6 +687,13 @@ impl App {
                             util_pct: None,
                             queue: None,
                             lat_ms: None,
+                            idle_secs: idle_secs(
+                                &mut self.disk_last_active,
+                                &d.name,
+                                s.taken,
+                                false,
+                                d.read_bytes + d.written_bytes > 0,
+                            ),
                         };
                     };
                     let read_bps = d.read_bytes.saturating_sub(p.read_bytes) as f64 / dt;
@@ -576,9 +722,18 @@ impl App {
                         util_pct: busy.map(|b| (b as f64 * 100.0 / dt_ns).min(100.0)),
                         queue: weighted.map(|w| w as f64 / dt_ns),
                         lat_ms: io.and_then(|t| (d_ops > 0.0).then(|| t as f64 / 1e6 / d_ops)),
+                        idle_secs: idle_secs(
+                            &mut self.disk_last_active,
+                            &d.name,
+                            s.taken,
+                            read_bps > 0.0 || write_bps > 0.0 || d_ops > 0.0,
+                            d.read_bytes + d.written_bytes > 0,
+                        ),
                     }
                 })
                 .collect();
+            self.disk_last_active
+                .retain(|name, _| s.disks.iter().any(|d| &d.name == name));
             push_capped(&mut self.disk_io, total_bps);
             self.refilter();
         }
@@ -589,9 +744,12 @@ impl App {
         self.core_temps_c = s.core_temps_c.clone();
         self.gpu_name = s.gpu_name.clone();
         self.gpu_util_pct = s.gpu_util_pct;
+        // no dt needed: util is already a percentage, so track it every snapshot
+        if let Some(util) = s.gpu_util_pct {
+            push_capped(&mut self.gpu_hist, util);
+        }
         self.load_avg = s.load_avg;
         self.uptime_secs = s.uptime_secs;
-        self.net_iface = s.net.iface.clone();
         self.net_rx_total = s.net.rx_bytes;
         self.net_tx_total = s.net.tx_bytes;
         self.status = None;
@@ -612,11 +770,17 @@ impl App {
         if !self.show_threads {
             return;
         }
+        // only the selected process grows thread rows; a selected thread row
+        // counts as its parent (the anchor pid is the parent pid already)
+        let sel = self.selected_pid();
         let parents = std::mem::take(&mut self.procs);
         let mut out = Vec::with_capacity(parents.len());
         for p in parents {
             let pid = p.pid;
             out.push(p);
+            if Some(pid) != sel {
+                continue;
+            }
             let Some(ts) = self.threads_by_pid.get(&pid) else {
                 continue;
             };
@@ -655,7 +819,11 @@ impl App {
             procs: &procs,
             children: &children,
             threads: &self.threads_by_pid,
-            show_threads: self.show_threads,
+            threads_for: if self.show_threads {
+                self.selected_pid()
+            } else {
+                None
+            },
             sort: self.sort,
             seen: HashSet::with_capacity(procs.len()),
             out: Vec::with_capacity(procs.len()),
@@ -697,6 +865,28 @@ impl App {
     pub fn select(&mut self, idx: usize) {
         self.selected = idx;
         self.selected_id = self.procs.get(idx).map(|p| (p.pid, p.tid));
+    }
+
+    /// pid whose threads should render: the selection's pid. a thread row's
+    /// anchor pid is its parent pid already, so no translation needed
+    fn selected_pid(&self) -> Option<i32> {
+        self.selected_id.map(|(pid, _)| pid)
+    }
+
+    /// net rows the h toggle lets through, panel order preserved
+    pub fn visible_net(&self) -> Vec<&NetRow> {
+        self.net_ifaces
+            .iter()
+            .filter(|r| self.show_idle || r.idle_secs <= IDLE_HIDE_SECS)
+            .collect()
+    }
+
+    /// disk rows the h toggle lets through, panel order preserved
+    pub fn visible_disks(&self) -> Vec<&DiskRow> {
+        self.disks
+            .iter()
+            .filter(|r| self.show_idle || r.idle_secs <= IDLE_HIDE_SECS)
+            .collect()
     }
 
     /// first visible row; draw clamps it each frame and the mouse handler
@@ -768,7 +958,11 @@ mod tests {
         a.net = NetSnapshot {
             rx_bytes: 1_000,
             tx_bytes: 500,
-            iface: Some("eth0".into()),
+            interfaces: vec![crate::collect::NetIface {
+                name: "eth0".into(),
+                rx_bytes: 1_000,
+                tx_bytes: 500,
+            }],
         };
         a.procs = vec![ProcessInfo {
             pid: 1,
@@ -785,7 +979,11 @@ mod tests {
         b.net = NetSnapshot {
             rx_bytes: 101_000,
             tx_bytes: 50_500,
-            iface: Some("eth0".into()),
+            interfaces: vec![crate::collect::NetIface {
+                name: "eth0".into(),
+                rx_bytes: 101_000,
+                tx_bytes: 50_500,
+            }],
         };
         b.procs = vec![
             ProcessInfo {
@@ -871,6 +1069,46 @@ mod tests {
     }
 
     #[test]
+    fn s_opens_fetch_popup_and_it_swallows_keys() {
+        let mut app = App::default();
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        assert!(app.fetch.is_some(), "s opens the popup");
+
+        // sort keys bounce off while it's open
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('m'))));
+        assert!(app.fetch.is_some());
+        assert_eq!(app.sort, SortBy::Cpu, "swallowed key must not sort");
+
+        // esc closes the popup, not the app
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(app.fetch.is_none());
+        assert!(!app.quit, "esc closes the popup, not the app");
+
+        // q closes it too without quitting
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('q'))));
+        assert!(app.fetch.is_none());
+        assert!(!app.quit, "q inside the popup must not quit");
+
+        // s toggles it shut as well
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        assert!(app.fetch.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_quits_through_the_fetch_popup() {
+        let mut app = App::default();
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('s'))));
+        assert!(app.fetch.is_some());
+        app.on_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        )));
+        assert!(app.quit, "ctrl-c must quit from anywhere");
+    }
+
+    #[test]
     fn kill_confirm_signals_the_process() {
         use std::os::unix::process::ExitStatusExt;
         let mut child = std::process::Command::new("/bin/sleep")
@@ -930,6 +1168,28 @@ mod tests {
     }
 
     #[test]
+    fn gpu_hist_accumulates_from_snapshots() {
+        let mut app = App::default();
+        let mut a = snap(100, 900);
+        a.gpu_util_pct = Some(25.0);
+        app.on_event(AppEvent::Snapshot(a));
+        let mut b = snap(150, 950);
+        b.gpu_util_pct = Some(75.0);
+        app.on_event(AppEvent::Snapshot(b));
+        // unlike cpu it needs no prev to diff against: first snapshot counts
+        assert_eq!(app.gpu_hist, [25.0, 75.0]);
+    }
+
+    #[test]
+    fn gpu_hist_stays_empty_without_a_gpu() {
+        let mut app = App::default();
+        app.on_event(AppEvent::Snapshot(snap(100, 900)));
+        app.on_event(AppEvent::Snapshot(snap(150, 950)));
+        assert!(app.gpu_util_pct.is_none());
+        assert!(app.gpu_hist.is_empty());
+    }
+
+    #[test]
     fn net_rates_from_deltas() {
         let mut app = App::default();
         let (a, b) = pair();
@@ -938,6 +1198,105 @@ mod tests {
         // 100_000 rx and 50_000 tx bytes over 1s
         assert!((app.net_rx[0] - 100_000.0).abs() < 1_000.0);
         assert!((app.net_tx[0] - 50_000.0).abs() < 500.0);
+        // the per-interface row mirrors the aggregate for the single iface
+        assert_eq!(app.net_ifaces.len(), 1);
+        assert_eq!(app.net_ifaces[0].name, "eth0");
+        assert!((app.net_ifaces[0].rx_bps - 100_000.0).abs() < 1_000.0);
+        assert!((app.net_ifaces[0].tx_bps - 50_000.0).abs() < 500.0);
+    }
+
+    #[test]
+    fn idle_rows_hide_after_grace_and_h_reveals() {
+        let mut app = App::default();
+        let (a, mut b) = pair();
+        let base = a.taken;
+        let iface = |name: &str, rx: u64, tx: u64| crate::collect::NetIface {
+            name: name.into(),
+            rx_bytes: rx,
+            tx_bytes: tx,
+        };
+        app.on_event(AppEvent::Snapshot(a));
+        b.net.interfaces = vec![
+            iface("gif0", 0, 0),
+            iface("en0", 101_000, 50_500),
+            iface("utun4", 7_000, 3_000),
+        ];
+        app.on_event(AppEvent::Snapshot(b));
+        // busiest lifetime first: en0, utun4, gif0
+        let names: Vec<&str> = app.net_ifaces.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["en0", "utun4", "gif0"]);
+        // first sight shows nothing: a row must earn its spot with a live byte
+        assert!(app.visible_net().is_empty(), "all born hidden at startup");
+
+        // en0 moves bytes -> it appears; the quiet ones stay hidden
+        let mut c = snap(200, 1000);
+        c.taken = base + Duration::from_secs(2);
+        c.net = NetSnapshot {
+            rx_bytes: 108_000,
+            tx_bytes: 53_500,
+            interfaces: vec![
+                iface("gif0", 0, 0),
+                iface("en0", 108_000, 53_500),
+                iface("utun4", 7_000, 3_000),
+            ],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Snapshot(c));
+        let vis: Vec<&str> = app.visible_net().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(vis, ["en0"], "traffic earns the row");
+
+        // 6 quiet seconds later en0 exceeds the grace period and hides again
+        let mut d = snap(250, 1050);
+        d.taken = base + Duration::from_secs(8);
+        d.net = NetSnapshot {
+            rx_bytes: 108_000,
+            tx_bytes: 53_500,
+            interfaces: vec![
+                iface("gif0", 0, 0),
+                iface("en0", 108_000, 53_500),
+                iface("utun4", 7_000, 3_000),
+            ],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Snapshot(d));
+        assert!(app.visible_net().is_empty(), "idle past grace hides");
+
+        // h shows them all again
+        key(&mut app, KeyCode::Char('h'));
+        assert!(app.show_idle);
+        assert_eq!(app.visible_net().len(), 3);
+        key(&mut app, KeyCode::Char('h'));
+        assert!(!app.show_idle, "h toggles back; hiding is the default");
+    }
+
+    #[test]
+    fn net_iface_history_accumulates_and_prunes() {
+        let mut app = App::default();
+        let (a, b) = pair();
+        let base = a.taken;
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        let (rx_h, tx_h) = app.net_hist.get("eth0").expect("history exists");
+        assert_eq!(rx_h.len(), 1);
+        assert!((rx_h[0] - 100_000.0).abs() < 1_000.0);
+        assert!((tx_h[0] - 50_000.0).abs() < 500.0);
+
+        // eth0 goes away, wlan0 appears -> old history is pruned
+        let mut c = snap(200, 1000);
+        c.taken = base + Duration::from_secs(2);
+        c.net = NetSnapshot {
+            rx_bytes: 102_000,
+            tx_bytes: 51_000,
+            interfaces: vec![crate::collect::NetIface {
+                name: "wlan0".into(),
+                rx_bytes: 1_000,
+                tx_bytes: 500,
+            }],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Snapshot(c));
+        assert!(app.net_hist.get("eth0").is_none(), "vanished iface pruned");
+        assert!(app.net_hist.get("wlan0").is_some());
     }
 
     #[test]
@@ -1438,6 +1797,8 @@ mod tests {
         let mut app = App::default();
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         assert_eq!(app.procs.len(), 2, "threads hidden until toggled");
 
@@ -1468,6 +1829,8 @@ mod tests {
         key(&mut app, KeyCode::Char('t'));
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         // worker burned 300ms in 1s, the unnamed thread 100ms
         let worker = app.procs.iter().find(|p| p.tid == Some(10)).unwrap();
@@ -1483,6 +1846,8 @@ mod tests {
         let (a, b) = thread_pair();
         let base = a.taken;
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         // [alpha, worker, tid 11, beta]; anchor on worker
         key(&mut app, KeyCode::Down);
@@ -1531,6 +1896,8 @@ mod tests {
         key(&mut app, KeyCode::Char('t'));
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
         // move onto worker (a thread of alpha) and hit k
         key(&mut app, KeyCode::Down);
@@ -1547,6 +1914,8 @@ mod tests {
         key(&mut app, KeyCode::Char('t'));
         let (a, b) = thread_pair();
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on alpha first
+        app.selected_id = Some((1, None));
         app.on_event(AppEvent::Snapshot(b));
 
         // alpha filtered out -> its threads go with it
@@ -1566,6 +1935,30 @@ mod tests {
         }
         let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
         assert_eq!(ids, [(1, None), (1, Some(10)), (1, Some(11))]);
+    }
+
+    #[test]
+    fn threads_render_only_under_the_selected_process() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('t'));
+        let (a, b) = thread_pair();
+        app.on_event(AppEvent::Snapshot(a));
+        // park the highlight on beta; alpha's rows land in threads_by_pid
+        // but must not render under a de-selected proc
+        app.selected_id = Some((2, None));
+        app.on_event(AppEvent::Snapshot(b));
+        assert!(app.threads_by_pid.contains_key(&1), "rows were collected");
+        assert!(
+            app.procs.iter().all(|p| p.tid.is_none()),
+            "no thread rows for a non-selected proc"
+        );
+
+        // moving the selection onto alpha and reweaving brings them out
+        let idx = app.procs.iter().position(|p| p.pid == 1).unwrap();
+        app.select(idx);
+        app.refilter();
+        let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
+        assert_eq!(ids, [(1, None), (1, Some(10)), (1, Some(11)), (2, None)]);
     }
 
     #[test]
@@ -1738,6 +2131,8 @@ mod tests {
             pproc(4, 2, "four", 200_000_000),
         ];
         app.on_event(AppEvent::Snapshot(a));
+        // threads only weave under the selected proc; park on 2 first
+        app.selected_id = Some((2, None));
         app.on_event(AppEvent::Snapshot(b));
         let ids: Vec<(i32, Option<u64>)> = app.procs.iter().map(|p| (p.pid, p.tid)).collect();
         // threads of 2 come first (cpu desc), then its child proc 4
@@ -1836,5 +2231,37 @@ mod tests {
         app.reanchor();
         assert_eq!(app.selected, 2);
         assert_eq!(app.view_offset, 0, "cannot scroll above the first row");
+    }
+
+    #[test]
+    fn refresh_interval_defaults_and_clamps() {
+        let mut app = App::default();
+        assert_eq!(app.refresh_ms(), 1000, "derive(Default) 0 reads as 1s");
+
+        // + slows the refresh, btop style; = is the same physical key
+        key(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.refresh_ms(), 1100);
+        key(&mut app, KeyCode::Char('='));
+        assert_eq!(app.refresh_ms(), 1200);
+        app.update_ms = 10_000;
+        key(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.refresh_ms(), 10_000, "clamped at 10s");
+
+        // - speeds it up, floor at 100ms
+        app.update_ms = 200;
+        key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.refresh_ms(), 100);
+        key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.refresh_ms(), 100, "clamped at 100ms");
+    }
+
+    #[test]
+    fn plus_minus_while_filter_editing_is_text_not_interval() {
+        let mut app = App::default();
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Char('+'));
+        key(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.filter, "+-");
+        assert_eq!(app.refresh_ms(), 1000, "interval untouched");
     }
 }

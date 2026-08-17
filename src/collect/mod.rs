@@ -46,13 +46,21 @@ pub struct MemSnapshot {
     pub swap_used: u64,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NetSnapshot {
-    /// cumulative bytes, loopback excluded
+/// one physical interface's cumulative traffic; loopback is excluded
+#[derive(Debug, Clone)]
+pub struct NetIface {
+    pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
-    /// busiest non-loopback interface by cumulative traffic
-    pub iface: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetSnapshot {
+    /// aggregate cumulative bytes over all physical interfaces
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// one entry per physical interface, in discovery order
+    pub interfaces: Vec<NetIface>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,8 +108,8 @@ pub struct ProcessInfo {
     /// None when the process is not ours to inspect
     pub disk_read: Option<u64>,
     pub disk_written: Option<u64>,
-    /// per-thread breakdown; only filled when the caller asked for it
-    /// (it costs a pile of extra syscalls), empty on per-process errors too
+    /// per-thread breakdown; only filled for the single pid the caller asked
+    /// about (it costs a pile of extra syscalls), empty on per-process errors too
     pub threads: Vec<ThreadInfo>,
 }
 
@@ -116,7 +124,7 @@ pub struct Snapshot {
     /// static per boot but cheap; collectors fill every tick
     pub cpu_name: Option<String>,
     pub cpu_temp_c: Option<f64>,
-    /// per-core (or per-sensor-group) temps in reported order; empty = unknown
+    /// one temp per logical cpu (NaN = no sensor for that cpu); empty = unknown
     pub core_temps_c: Vec<f64>,
     pub gpu_name: Option<String>,
     pub gpu_util_pct: Option<f64>,
@@ -147,9 +155,9 @@ impl Default for Snapshot {
 }
 
 pub trait Collector: Send {
-    /// `threads`: also collect per-thread info; skipped when false because
-    /// it's hundreds of extra file reads/syscalls per tick
-    fn collect(&mut self, threads: bool) -> Result<Snapshot, CollectError>;
+    /// `threads_for`: pid whose per-thread info to also collect; None skips
+    /// thread work entirely because it's hundreds of extra file reads/syscalls
+    fn collect(&mut self, threads_for: Option<i32>) -> Result<Snapshot, CollectError>;
 }
 
 /// 1/5/15 minute load averages; same libc call on linux and macos

@@ -1,5 +1,5 @@
 use super::{
-    CollectError, Collector, CpuSnapshot, CpuTimes, MemSnapshot, MountInfo, NetSnapshot,
+    CollectError, Collector, CpuSnapshot, CpuTimes, MemSnapshot, MountInfo, NetIface, NetSnapshot,
     ProcessInfo, Snapshot, ThreadInfo,
 };
 use libc::{
@@ -219,7 +219,7 @@ unsafe extern "C" {
 pub struct MacCollector;
 
 impl Collector for MacCollector {
-    fn collect(&mut self, threads: bool) -> Result<Snapshot, CollectError> {
+    fn collect(&mut self, threads_for: Option<i32>) -> Result<Snapshot, CollectError> {
         let brand = cached_cpu_brand();
         let (cpu_temp_c, core_temps_c) = super::macos_sensors::cpu_temps();
         Ok(Snapshot {
@@ -228,7 +228,7 @@ impl Collector for MacCollector {
             net: net_snapshot()?,
             disks: super::macos_iokit::disks()?,
             mounts: mounts_snapshot(),
-            procs: procs_snapshot(threads)?,
+            procs: procs_snapshot(threads_for)?,
             cpu_name: brand.clone(),
             cpu_temp_c,
             core_temps_c,
@@ -487,7 +487,6 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
     }
 
     let mut net = NetSnapshot::default();
-    let mut best: (u64, u16) = (0, 0); // (traffic, ifm_index)
     let mut off = 0usize;
     while off + size_of::<IfMsghdr2Prefix>() <= len {
         // SAFETY: bounds-checked above; the routing message stream is packed,
@@ -507,27 +506,34 @@ fn net_snapshot() -> Result<NetSnapshot, CollectError> {
                 )
             };
             if d.ifi_type != IFT_LOOP {
-                net.rx_bytes += d.ifi_ibytes;
-                net.tx_bytes += d.ifi_obytes;
-                let traffic = d.ifi_ibytes + d.ifi_obytes;
-                if traffic > best.0 {
-                    best = (traffic, hdr.ifm_index);
-                }
+                let iface = NetIface {
+                    name: ifname(hdr.ifm_index),
+                    rx_bytes: d.ifi_ibytes,
+                    tx_bytes: d.ifi_obytes,
+                };
+                net.rx_bytes += iface.rx_bytes;
+                net.tx_bytes += iface.tx_bytes;
+                net.interfaces.push(iface);
             }
         }
         off += hdr.ifm_msglen as usize;
     }
-    if best.0 > 0 {
-        let mut name = [0u8; libc::IF_NAMESIZE];
-        // SAFETY: buffer is IF_NAMESIZE bytes as the contract requires
-        let p = unsafe { libc::if_indextoname(best.1.into(), name.as_mut_ptr().cast()) };
-        if !p.is_null() {
-            // SAFETY: if_indextoname NUL-terminates on success
-            let s = unsafe { std::ffi::CStr::from_ptr(name.as_ptr().cast()) };
-            net.iface = s.to_str().ok().map(str::to_owned);
-        }
-    }
     Ok(net)
+}
+
+/// interface index to a name; falls back to the index when the name is unreadable
+fn ifname(index: u16) -> String {
+    let mut name = [0u8; libc::IF_NAMESIZE];
+    // SAFETY: buffer is IF_NAMESIZE bytes as the contract requires
+    let p = unsafe { libc::if_indextoname(index.into(), name.as_mut_ptr().cast()) };
+    if p.is_null() {
+        return format!("if{index}");
+    }
+    // SAFETY: if_indextoname NUL-terminates on success
+    let s = unsafe { std::ffi::CStr::from_ptr(name.as_ptr().cast()) };
+    s.to_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|_| format!("if{index}"))
 }
 
 /// kern.proc.all sweep: one kinfo_proc per process, root-owned included, no
@@ -589,7 +595,7 @@ fn kinfo_sweep() -> Result<Vec<u8>, CollectError> {
     })
 }
 
-fn procs_snapshot(threads: bool) -> Result<Vec<ProcessInfo>, CollectError> {
+fn procs_snapshot(threads_for: Option<i32>) -> Result<Vec<ProcessInfo>, CollectError> {
     let table = kinfo_sweep()?;
 
     let mut tb = TimebaseInfo { numer: 0, denom: 0 };
@@ -668,8 +674,8 @@ fn procs_snapshot(threads: bool) -> Result<Vec<ProcessInfo>, CollectError> {
             rss,
             disk_read,
             disk_written,
-            // hundreds of extra syscalls per tick — only when the view wants it
-            threads: if threads {
+            // hundreds of extra syscalls per tick — only the selected pid pays
+            threads: if threads_for == Some(pid) {
                 threads_snapshot(pid, ti.pti_threadnum)
             } else {
                 Vec::new()
@@ -748,9 +754,9 @@ mod tests {
     #[test]
     fn collects_sane_values() {
         let mut c = MacCollector;
-        let a = c.collect(false).unwrap();
+        let a = c.collect(None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let b = c.collect(false).unwrap();
+        let b = c.collect(None).unwrap();
 
         assert!(!a.cpu.per_core.is_empty());
         assert_eq!(a.cpu.per_core.len(), b.cpu.per_core.len());
@@ -765,7 +771,7 @@ mod tests {
     #[test]
     fn net_and_procs_are_sane() {
         let mut c = MacCollector;
-        let s = c.collect(false).unwrap();
+        let s = c.collect(None).unwrap();
         // this machine always has non-loopback traffic and processes
         assert!(s.net.rx_bytes > 0);
         assert!(s.net.tx_bytes > 0);
@@ -782,7 +788,7 @@ mod tests {
     fn own_process_reports_real_ppid() {
         // the kernel knows who spawned us; parent_id() is the ground truth
         let mut c = MacCollector;
-        let s = c.collect(false).unwrap();
+        let s = c.collect(None).unwrap();
         let me = std::process::id() as i32;
         let p = s.procs.iter().find(|p| p.pid == me).unwrap();
         assert_eq!(p.ppid, std::os::unix::process::parent_id() as i32);
@@ -793,7 +799,7 @@ mod tests {
         // the point of the KERN_PROC_ALL sweep: pids we can't pidinfo still
         // show up, so the ppid tree stays rooted
         let mut c = MacCollector;
-        let s = c.collect(false).unwrap();
+        let s = c.collect(None).unwrap();
         let p1 = s.procs.iter().find(|p| p.pid == 1);
         let p1 = p1.expect("pid 1 visible without root");
         assert_eq!(p1.name, "launchd");
@@ -812,7 +818,7 @@ mod tests {
     #[test]
     fn disks_and_mounts_are_sane() {
         let mut c = MacCollector;
-        let s = c.collect(false).unwrap();
+        let s = c.collect(None).unwrap();
         // every mac has at least one physical whole disk with counters
         assert!(!s.disks.is_empty());
         assert!(
@@ -839,7 +845,7 @@ mod tests {
         let path = std::env::temp_dir().join("rmon_io_probe");
         std::fs::write(&path, vec![7u8; 1 << 20]).unwrap();
         let mut c = MacCollector;
-        let s = c.collect(false).unwrap();
+        let s = c.collect(None).unwrap();
         let _ = std::fs::remove_file(&path);
         let me = std::process::id() as i32;
         let p = s.procs.iter().find(|p| p.pid == me).unwrap();
@@ -868,9 +874,9 @@ mod tests {
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let mut c = MacCollector;
-        let s = c.collect(true).unwrap();
         let me = std::process::id() as i32;
+        let mut c = MacCollector;
+        let s = c.collect(Some(me)).unwrap();
         let p = s.procs.iter().find(|p| p.pid == me).unwrap();
         assert!(p.threads.len() >= 2, "main + probe at minimum");
         let probe = p.threads.iter().find(|t| t.name == "rmon-probe");
@@ -881,8 +887,8 @@ mod tests {
         assert!(probe.cpu_ns > 0);
         assert!(probe.cpu_ns < 10_000_000_000);
 
-        // gating off must mean zero thread work
-        let s = c.collect(false).unwrap();
+        // asking for no pid must mean zero thread work
+        let s = c.collect(None).unwrap();
         let p = s.procs.iter().find(|p| p.pid == me).unwrap();
         assert!(p.threads.is_empty());
 

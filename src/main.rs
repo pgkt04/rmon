@@ -1,10 +1,11 @@
 mod app;
 mod bench;
 mod collect;
+mod fetch;
 mod smart;
 mod ui;
 
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -27,21 +28,26 @@ fn main() -> Result<()> {
 
     let collector_tx = tx.clone();
     let tx_bench = tx.clone();
-    // the collector thread only pays for per-thread stats while the t
-    // toggle is on; the ui side flips this after every key
-    let show_threads = Arc::new(AtomicBool::new(false));
-    let collect_threads = show_threads.clone();
+    // the collector thread only pays for per-thread stats for the one pid
+    // the ui has selected; -1 = t toggle off. ui stores it after every event
+    let thread_pid = Arc::new(AtomicI64::new(-1));
+    let collect_pid = thread_pid.clone();
+    // refresh cadence in ms; +/- in the ui writes it, the collector reads
+    // it fresh each tick so changes land without waking anything
+    let update_ms = Arc::new(AtomicU64::new(1000));
+    let collect_ms = update_ms.clone();
     thread::spawn(move || {
         let mut collector = collect::new_collector();
         loop {
-            let ev = match collector.collect(collect_threads.load(Relaxed)) {
+            let v = collect_pid.load(Relaxed);
+            let ev = match collector.collect((v >= 0).then(|| v as i32)) {
                 Ok(s) => AppEvent::Snapshot(Box::new(s)),
                 Err(e) => AppEvent::CollectError(e.to_string()),
             };
             if collector_tx.send(ev).is_err() {
                 return; // app is gone
             }
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(collect_ms.load(Relaxed)));
         }
     });
 
@@ -97,7 +103,7 @@ fn main() -> Result<()> {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
         hook(info);
     }));
-    let res = run(&mut terminal, rx, tx_bench, &show_threads);
+    let res = run(&mut terminal, rx, tx_bench, &thread_pid, &update_ms);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
@@ -107,7 +113,8 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     rx: mpsc::Receiver<AppEvent>,
     tx_bench: mpsc::Sender<AppEvent>,
-    show_threads: &AtomicBool,
+    thread_pid: &AtomicI64,
+    update_ms: &AtomicU64,
 ) -> Result<()> {
     let mut app = App::default();
     while !app.quit {
@@ -120,10 +127,20 @@ fn run(
             }
             Ok(ev) => {
                 app.on_event(ev);
-                show_threads.store(app.show_threads, Relaxed);
+                update_ms.store(app.refresh_ms(), Relaxed);
             }
             Err(_) => break,
         }
+        // clicks move the selection too, so this runs for every event kind:
+        // tell the collector which pid (if any) should pay for thread detail
+        thread_pid.store(
+            if app.show_threads {
+                app.selected_id.map(|(p, _)| p as i64).unwrap_or(-1)
+            } else {
+                -1
+            },
+            Relaxed,
+        );
         // the picker (b key) chose a target; unwritable dirs surface as a
         // clean bench error in the panel, so no probe needed here
         if let Some(target) = app.bench_target.take() {
