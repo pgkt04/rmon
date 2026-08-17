@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 
@@ -9,6 +10,9 @@ use crate::smart::SmartInfo;
 // braille packs 2 samples per char column: 720 samples fill a 360-col
 // terminal; 300 could never reach the left edge past 150 chars
 pub const HISTORY: usize = 720;
+
+/// a net/dsk row idle this long stops rendering unless `h` shows it
+pub const IDLE_HIDE_SECS: f64 = 5.0;
 
 pub enum AppEvent {
     Snapshot(Box<Snapshot>),
@@ -57,6 +61,8 @@ pub struct DiskRow {
     pub util_pct: Option<f64>,
     pub queue: Option<f64>,
     pub lat_ms: Option<f64>,
+    /// seconds since the device last moved a byte; drives the h toggle
+    pub idle_secs: f64,
 }
 
 /// one physical interface with its live rx/tx rates
@@ -65,6 +71,8 @@ pub struct NetRow {
     pub name: String,
     pub rx_bps: f64,
     pub tx_bps: f64,
+    /// seconds since the interface last moved a byte; drives the h toggle
+    pub idle_secs: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +130,17 @@ pub struct App {
     pub view_offset: usize,
     /// true while the mouse is dragging the proc scrollbar thumb
     pub drag_scroll: bool,
+    /// `h` flips this: false (default) hides net/dsk rows idle > 5s
+    pub show_idle: bool,
+    /// net and dsk row viewports; draw clamps them and records the row
+    /// capacity so the mouse maps against what was actually on screen
+    pub net_offset: usize,
+    pub dsk_offset: usize,
+    pub net_rows_cap: usize,
+    pub dsk_rows_cap: usize,
+    /// scrollbar drags in flight on the net / dsk row lists
+    pub drag_net: bool,
+    pub drag_dsk: bool,
     pub sort: SortBy,
     pub status: Option<String>,
     pub bench: Option<BenchState>,
@@ -149,6 +168,12 @@ pub struct App {
     pub load_avg: Option<[f64; 3]>,
     pub uptime_secs: Option<u64>,
     pub net_ifaces: Vec<NetRow>,
+    /// per-interface rate history keyed by name: (rx, tx), HISTORY-capped;
+    /// vanished interfaces are pruned so hotplug churn cannot leak
+    pub net_hist: HashMap<String, (VecDeque<f64>, VecDeque<f64>)>,
+    /// last instant each interface / disk moved a byte, for the h toggle
+    net_last_active: HashMap<String, Instant>,
+    disk_last_active: HashMap<String, Instant>,
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     prev: Option<Snapshot>,
@@ -159,6 +184,29 @@ fn push_capped(hist: &mut VecDeque<f64>, v: f64) {
     if hist.len() > HISTORY {
         hist.pop_front();
     }
+}
+
+/// seconds since `name` last moved a byte. never-active devices are born
+/// past the grace period so they start hidden; active ones reset to zero
+fn idle_secs(
+    map: &mut HashMap<String, Instant>,
+    name: &str,
+    now: Instant,
+    active_now: bool,
+    ever_active: bool,
+) -> f64 {
+    let seen = map.entry(name.to_owned()).or_insert_with(|| {
+        if ever_active {
+            now
+        } else {
+            now.checked_sub(std::time::Duration::from_secs_f64(IDLE_HIDE_SECS + 1.0))
+                .unwrap_or(now)
+        }
+    });
+    if active_now {
+        *seen = now;
+    }
+    now.duration_since(*seen).as_secs_f64()
 }
 
 /// one comparator shared by flat and tree mode so sibling order matches the list
@@ -384,6 +432,7 @@ impl App {
                 self.tree = !self.tree;
                 self.refilter();
             }
+            KeyCode::Char('h') => self.show_idle = !self.show_idle,
             KeyCode::Char('b') => {
                 let running = self
                     .bench
@@ -474,23 +523,42 @@ impl App {
                 .iter()
                 .map(|i| (i.name.as_str(), i))
                 .collect();
-            self.net_ifaces = s
-                .net
-                .interfaces
+            // every interface earns a row (h hides the idle ones), busiest
+            // lifetime traffic first so the live nic tops the list
+            let mut lively: Vec<&crate::collect::NetIface> = s.net.interfaces.iter().collect();
+            lively.sort_by_key(|i| std::cmp::Reverse(i.rx_bytes + i.tx_bytes));
+            self.net_ifaces = lively
                 .iter()
                 .map(|i| {
                     let p = prev_ifaces.get(i.name.as_str());
+                    let rx_bps = p
+                        .map(|q| i.rx_bytes.saturating_sub(q.rx_bytes) as f64 / dt)
+                        .unwrap_or(0.0);
+                    let tx_bps = p
+                        .map(|q| i.tx_bytes.saturating_sub(q.tx_bytes) as f64 / dt)
+                        .unwrap_or(0.0);
+                    let (rx_h, tx_h) = self.net_hist.entry(i.name.clone()).or_default();
+                    push_capped(rx_h, rx_bps);
+                    push_capped(tx_h, tx_bps);
+                    let idle_secs = idle_secs(
+                        &mut self.net_last_active,
+                        &i.name,
+                        s.taken,
+                        rx_bps > 0.0 || tx_bps > 0.0,
+                        i.rx_bytes + i.tx_bytes > 0,
+                    );
                     NetRow {
                         name: i.name.clone(),
-                        rx_bps: p
-                            .map(|q| i.rx_bytes.saturating_sub(q.rx_bytes) as f64 / dt)
-                            .unwrap_or(0.0),
-                        tx_bps: p
-                            .map(|q| i.tx_bytes.saturating_sub(q.tx_bytes) as f64 / dt)
-                            .unwrap_or(0.0),
+                        rx_bps,
+                        tx_bps,
+                        idle_secs,
                     }
                 })
                 .collect();
+            self.net_hist
+                .retain(|name, _| s.net.interfaces.iter().any(|i| &i.name == name));
+            self.net_last_active
+                .retain(|name, _| s.net.interfaces.iter().any(|i| &i.name == name));
 
             let prev_by_pid: HashMap<i32, &crate::collect::ProcessInfo> =
                 prev.procs.iter().map(|p| (p.pid, p)).collect();
@@ -580,6 +648,13 @@ impl App {
                             util_pct: None,
                             queue: None,
                             lat_ms: None,
+                            idle_secs: idle_secs(
+                                &mut self.disk_last_active,
+                                &d.name,
+                                s.taken,
+                                false,
+                                d.read_bytes + d.written_bytes > 0,
+                            ),
                         };
                     };
                     let read_bps = d.read_bytes.saturating_sub(p.read_bytes) as f64 / dt;
@@ -608,9 +683,18 @@ impl App {
                         util_pct: busy.map(|b| (b as f64 * 100.0 / dt_ns).min(100.0)),
                         queue: weighted.map(|w| w as f64 / dt_ns),
                         lat_ms: io.and_then(|t| (d_ops > 0.0).then(|| t as f64 / 1e6 / d_ops)),
+                        idle_secs: idle_secs(
+                            &mut self.disk_last_active,
+                            &d.name,
+                            s.taken,
+                            read_bps > 0.0 || write_bps > 0.0 || d_ops > 0.0,
+                            d.read_bytes + d.written_bytes > 0,
+                        ),
                     }
                 })
                 .collect();
+            self.disk_last_active
+                .retain(|name, _| s.disks.iter().any(|d| &d.name == name));
             push_capped(&mut self.disk_io, total_bps);
             self.refilter();
         }
@@ -728,6 +812,22 @@ impl App {
     pub fn select(&mut self, idx: usize) {
         self.selected = idx;
         self.selected_id = self.procs.get(idx).map(|p| (p.pid, p.tid));
+    }
+
+    /// net rows the h toggle lets through, panel order preserved
+    pub fn visible_net(&self) -> Vec<&NetRow> {
+        self.net_ifaces
+            .iter()
+            .filter(|r| self.show_idle || r.idle_secs <= IDLE_HIDE_SECS)
+            .collect()
+    }
+
+    /// disk rows the h toggle lets through, panel order preserved
+    pub fn visible_disks(&self) -> Vec<&DiskRow> {
+        self.disks
+            .iter()
+            .filter(|r| self.show_idle || r.idle_secs <= IDLE_HIDE_SECS)
+            .collect()
     }
 
     /// first visible row; draw clamps it each frame and the mouse handler
@@ -982,6 +1082,85 @@ mod tests {
         assert_eq!(app.net_ifaces[0].name, "eth0");
         assert!((app.net_ifaces[0].rx_bps - 100_000.0).abs() < 1_000.0);
         assert!((app.net_ifaces[0].tx_bps - 50_000.0).abs() < 500.0);
+    }
+
+    #[test]
+    fn idle_rows_hide_after_grace_and_h_reveals() {
+        let mut app = App::default();
+        let (a, mut b) = pair();
+        let base = a.taken;
+        let iface = |name: &str, rx: u64, tx: u64| crate::collect::NetIface {
+            name: name.into(),
+            rx_bytes: rx,
+            tx_bytes: tx,
+        };
+        app.on_event(AppEvent::Snapshot(a));
+        b.net.interfaces = vec![
+            iface("gif0", 0, 0),           // never active: born hidden
+            iface("en0", 101_000, 50_500), // rate > 0 this tick
+            iface("utun4", 7_000, 3_000),  // lifetime traffic, idle now... rate 0
+        ];
+        app.on_event(AppEvent::Snapshot(b));
+        // busiest lifetime first: en0, utun4, gif0
+        let names: Vec<&str> = app.net_ifaces.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["en0", "utun4", "gif0"]);
+        // en0 active; utun4 first sight with lifetime traffic -> grace; gif0 born idle
+        let vis: Vec<&str> = app.visible_net().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(vis, ["en0", "utun4"], "gif0 hidden from birth");
+
+        // 6 quiet seconds later utun4 exceeds the grace period
+        let mut c = snap(200, 1000);
+        c.taken = base + Duration::from_secs(7);
+        c.net = NetSnapshot {
+            rx_bytes: 108_000,
+            tx_bytes: 53_500,
+            interfaces: vec![
+                iface("gif0", 0, 0),
+                iface("en0", 101_000, 50_500), // now idle too, but only 6s
+                iface("utun4", 7_000, 3_000),
+            ],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Snapshot(c));
+        let vis: Vec<&str> = app.visible_net().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(vis, Vec::<&str>::new(), "everything idle past grace hides");
+
+        // h shows them all again
+        key(&mut app, KeyCode::Char('h'));
+        assert!(app.show_idle);
+        assert_eq!(app.visible_net().len(), 3);
+        key(&mut app, KeyCode::Char('h'));
+        assert!(!app.show_idle, "h toggles back; hiding is the default");
+    }
+
+    #[test]
+    fn net_iface_history_accumulates_and_prunes() {
+        let mut app = App::default();
+        let (a, b) = pair();
+        let base = a.taken;
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        let (rx_h, tx_h) = app.net_hist.get("eth0").expect("history exists");
+        assert_eq!(rx_h.len(), 1);
+        assert!((rx_h[0] - 100_000.0).abs() < 1_000.0);
+        assert!((tx_h[0] - 50_000.0).abs() < 500.0);
+
+        // eth0 goes away, wlan0 appears -> old history is pruned
+        let mut c = snap(200, 1000);
+        c.taken = base + Duration::from_secs(2);
+        c.net = NetSnapshot {
+            rx_bytes: 102_000,
+            tx_bytes: 51_000,
+            interfaces: vec![crate::collect::NetIface {
+                name: "wlan0".into(),
+                rx_bytes: 1_000,
+                tx_bytes: 500,
+            }],
+            ..Default::default()
+        };
+        app.on_event(AppEvent::Snapshot(c));
+        assert!(app.net_hist.get("eth0").is_none(), "vanished iface pruned");
+        assert!(app.net_hist.get("wlan0").is_some());
     }
 
     #[test]

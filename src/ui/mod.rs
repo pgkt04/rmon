@@ -81,6 +81,45 @@ fn scroll_to(app: &mut App, row: u16, track: Rect) {
     app.select((((row - track.y) as usize * (len - 1)) / (track.height - 1) as usize).min(len - 1));
 }
 
+/// right-border track for a row list starting at screen row `y` with `cap`
+/// visible rows; None while everything fits
+fn rows_scrollbar(panel: Rect, y: u16, cap: usize, n: usize) -> Option<Rect> {
+    (n > cap && cap > 0).then(|| Rect {
+        x: panel.right() - 1,
+        y,
+        width: 1,
+        height: cap as u16,
+    })
+}
+
+/// the one scrollbar look, shared by every panel
+fn draw_scrollbar(f: &mut Frame, track: Rect, n: usize, pos: usize) {
+    use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+    let mut state = ScrollbarState::new(n).position(pos);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("░"))
+            .thumb_symbol("█")
+            .track_style(ratatui::style::Style::new().fg(theme::BORDER))
+            .thumb_style(ratatui::style::Style::new().fg(theme::TITLE)),
+        track,
+        &mut state,
+    );
+}
+
+/// map a pointer row on a viewport track to a row offset (top row index)
+fn offset_for(row: u16, track: Rect, n: usize, cap: usize) -> usize {
+    let span = n.saturating_sub(cap);
+    if span == 0 || track.height < 2 {
+        return 0;
+    }
+    let row = row.clamp(track.y, track.y + track.height - 1);
+    ((row - track.y) as usize * span)
+        .div_ceil((track.height - 1) as usize)
+        .min(span)
+}
 /// wheel scrolls the proc list, click selects a row, the scrollbar drags
 pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
     // the picker is modal: wheel moves, click runs a row, click outside closes
@@ -122,7 +161,7 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
         }
         return;
     }
-    let [_, _, _, proc_area, _] = panels(frame, app);
+    let [_, net_area, dsk_area, proc_area, _] = panels(frame, app);
     // drag/release can wander outside the panel, so handle them before the hit-test
     match m.kind {
         MouseEventKind::Drag(MouseButton::Left) if app.drag_scroll => {
@@ -131,11 +170,65 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
             }
             return;
         }
+        MouseEventKind::Drag(MouseButton::Left) if app.drag_net => {
+            let n = app.visible_net().len();
+            if let Some(track) = rows_scrollbar(net_area, net_area.y + 1, app.net_rows_cap, n) {
+                app.net_offset = offset_for(m.row, track, n, app.net_rows_cap);
+            }
+            return;
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.drag_dsk => {
+            let n = app.visible_disks().len();
+            if let Some(track) = rows_scrollbar(dsk_area, dsk_area.y + 1, app.dsk_rows_cap, n) {
+                app.dsk_offset = offset_for(m.row, track, n, app.dsk_rows_cap);
+            }
+            return;
+        }
         MouseEventKind::Up(MouseButton::Left) => {
             app.drag_scroll = false;
+            app.drag_net = false;
+            app.drag_dsk = false;
             return;
         }
         _ => {}
+    }
+    // net and dsk rows have no selection; the wheel moves their viewport and
+    // the border track drags it
+    if net_area.contains(Position::new(m.column, m.row)) {
+        let n = app.visible_net().len();
+        let max = n.saturating_sub(app.net_rows_cap);
+        match m.kind {
+            MouseEventKind::ScrollUp => app.net_offset = app.net_offset.saturating_sub(1),
+            MouseEventKind::ScrollDown => app.net_offset = (app.net_offset + 1).min(max),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(track) = rows_scrollbar(net_area, net_area.y + 1, app.net_rows_cap, n)
+                    && track.contains(Position::new(m.column, m.row))
+                {
+                    app.drag_net = true;
+                    app.net_offset = offset_for(m.row, track, n, app.net_rows_cap);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    if dsk_area.contains(Position::new(m.column, m.row)) {
+        let n = app.visible_disks().len();
+        let max = n.saturating_sub(app.dsk_rows_cap);
+        match m.kind {
+            MouseEventKind::ScrollUp => app.dsk_offset = app.dsk_offset.saturating_sub(1),
+            MouseEventKind::ScrollDown => app.dsk_offset = (app.dsk_offset + 1).min(max),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(track) = rows_scrollbar(dsk_area, dsk_area.y + 1, app.dsk_rows_cap, n)
+                    && track.contains(Position::new(m.column, m.row))
+                {
+                    app.drag_dsk = true;
+                    app.dsk_offset = offset_for(m.row, track, n, app.dsk_rows_cap);
+                }
+            }
+            _ => {}
+        }
+        return;
     }
     if !proc_area.contains(Position::new(m.column, m.row)) {
         return;
@@ -225,6 +318,7 @@ mod tests {
             util_pct: Some(37.5),
             queue: None,
             lat_ms: Some(0.42),
+            idle_secs: 0.0,
         }];
         app.mounts = vec![MountInfo {
             mount_point: "/".into(),
@@ -247,13 +341,22 @@ mod tests {
                 name: "en0".into(),
                 rx_bps: (1 << 20) as f64,
                 tx_bps: (400 << 10) as f64,
+                idle_secs: 0.0,
             },
             crate::app::NetRow {
                 name: "utun3".into(),
                 rx_bps: (8 << 10) as f64,
                 tx_bps: (2 << 10) as f64,
+                idle_secs: 0.0,
             },
         ];
+        app.net_hist = [("en0", 400_000.0), ("utun3", 4_000.0)]
+            .into_iter()
+            .map(|(n, base)| {
+                let wave = |k: u64| (0..60).map(|i| ((i * k) % 9) as f64 * base).collect();
+                (n.to_string(), (wave(3), wave(5)))
+            })
+            .collect();
         app.net_rx_total = 12 << 30;
         app.net_tx_total = 800 << 20;
         app.load_avg = Some([2.14, 1.82, 1.53]);
@@ -304,6 +407,123 @@ mod tests {
         assert!(text.contains("swap"));
         assert!(text.contains("3.0 GiB / 4.0 GiB"));
         assert!(text.contains('⣿'));
+    }
+
+    #[test]
+    fn net_rows_carry_their_own_sparklines() {
+        let backend = TestBackend::new(190, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        // find the en0 row and check for braille cells past the rates text
+        let buf = term.backend().buffer();
+        let [_, net_area, _, _, _] = panels(Rect::new(0, 0, 190, 46), &app);
+        let mut found = false;
+        for y in net_area.y + 1..net_area.y + net_area.height - 1 {
+            let line: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            if line.contains("en0") {
+                let tail: String = line.chars().skip(40).collect();
+                found = tail.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c));
+            }
+        }
+        assert!(found, "no braille sparkline on the en0 row");
+    }
+
+    /// enough interfaces that the net rows overflow their 4-row window
+    fn crowded_net_app() -> App {
+        let mut app = fake_app();
+        app.net_ifaces = (0..10)
+            .map(|i| crate::app::NetRow {
+                name: format!("en{i}"),
+                rx_bps: 1000.0,
+                tx_bps: 1000.0,
+                idle_secs: 0.0,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn net_wheel_scrolls_and_scrollbar_drags_the_viewport() {
+        let mut app = crowded_net_app();
+        let frame = Rect::new(0, 0, 80, 40);
+        // draw records the row capacity the mouse maps against
+        let backend = TestBackend::new(80, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let [_, net_area, _, _, _] = panels(frame, &app);
+        assert!(app.net_rows_cap > 0 && app.net_rows_cap < 10);
+
+        // wheel inside the panel moves the viewport, clamped at the overflow
+        let (cx, cy) = (net_area.x + 2, net_area.y + 2);
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, cx, cy), frame);
+        assert_eq!(app.net_offset, 1);
+        for _ in 0..20 {
+            handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, cx, cy), frame);
+        }
+        assert_eq!(app.net_offset, 10 - app.net_rows_cap, "clamped");
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, cx, cy), frame);
+        assert_eq!(app.net_offset, 10 - app.net_rows_cap - 1);
+
+        // grab the top of the border track: jump to 0 and start a drag
+        let track =
+            rows_scrollbar(net_area, net_area.y + 1, app.net_rows_cap, 10).expect("overflows");
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), track.x, track.y),
+            frame,
+        );
+        assert!(app.drag_net);
+        assert_eq!(app.net_offset, 0);
+        // drag to the bottom: max offset, even off-column
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                0,
+                track.y + track.height - 1,
+            ),
+            frame,
+        );
+        assert_eq!(app.net_offset, 10 - app.net_rows_cap);
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            frame,
+        );
+        assert!(!app.drag_net);
+    }
+
+    #[test]
+    fn dsk_wheel_scrolls_its_viewport() {
+        let mut app = fake_app();
+        app.disks = (0..12)
+            .map(|i| DiskRow {
+                name: format!("disk{i}"),
+                read_bps: 1.0,
+                write_bps: 1.0,
+                iops: 1.0,
+                util_pct: None,
+                queue: None,
+                lat_ms: None,
+                idle_secs: 0.0,
+            })
+            .collect();
+        let frame = Rect::new(0, 0, 80, 40);
+        let backend = TestBackend::new(80, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let [_, _, dsk_area, _, _] = panels(frame, &app);
+        assert!(app.dsk_rows_cap > 0 && app.dsk_rows_cap < 12);
+        let (cx, cy) = (dsk_area.x + 2, dsk_area.y + 2);
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, cx, cy), frame);
+        assert_eq!(app.dsk_offset, 1);
+        for _ in 0..30 {
+            handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, cx, cy), frame);
+        }
+        assert_eq!(app.dsk_offset, 12 - app.dsk_rows_cap, "clamped");
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
