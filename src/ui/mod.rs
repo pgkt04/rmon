@@ -49,7 +49,34 @@ fn panels(area: Rect, app: &App) -> [Rect; 5] {
     [cpu_area, net_area, dsk_area, proc_area, mem_area]
 }
 
-/// wheel scrolls the proc list, click selects a row
+/// right border column, one row in from each corner; None when the list fits
+fn scrollbar_rect(proc_area: Rect, n_procs: usize) -> Option<Rect> {
+    // border 2 + header 1, same math as the proc draw
+    let visible = (proc_area.height as usize).saturating_sub(3);
+    if n_procs <= visible {
+        return None;
+    }
+    Some(Rect {
+        x: proc_area.right() - 1,
+        y: proc_area.y + 1,
+        width: 1,
+        height: proc_area.height - 2,
+    })
+}
+
+/// map a pointer row on the scrollbar track to a proc index
+fn scroll_to(app: &mut App, row: u16, track: Rect) {
+    let len = app.procs.len();
+    if len < 2 || track.height < 2 {
+        return;
+    }
+    // pointer may be above/below the track mid-drag; pin it first
+    let row = row.clamp(track.y, track.y + track.height - 1);
+    app.selected =
+        (((row - track.y) as usize * (len - 1)) / (track.height - 1) as usize).min(len - 1);
+}
+
+/// wheel scrolls the proc list, click selects a row, the scrollbar drags
 pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
     // the picker is modal: wheel moves, click runs a row, click outside closes
     if let Some(p) = &mut app.picker {
@@ -81,6 +108,20 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
         return;
     }
     let [_, _, _, proc_area, _] = panels(frame, app);
+    // drag/release can wander outside the panel, so handle them before the hit-test
+    match m.kind {
+        MouseEventKind::Drag(MouseButton::Left) if app.drag_scroll => {
+            if let Some(track) = scrollbar_rect(proc_area, app.procs.len()) {
+                scroll_to(app, m.row, track);
+            }
+            return;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.drag_scroll = false;
+            return;
+        }
+        _ => {}
+    }
     if !proc_area.contains(Position::new(m.column, m.row)) {
         return;
     }
@@ -89,6 +130,14 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
         MouseEventKind::ScrollUp => app.selected = app.selected.saturating_sub(1),
         MouseEventKind::ScrollDown => app.selected = (app.selected + 1).min(last),
         MouseEventKind::Down(MouseButton::Left) => {
+            // grabbing the scrollbar must not select the row under it
+            if let Some(track) = scrollbar_rect(proc_area, app.procs.len())
+                && track.contains(Position::new(m.column, m.row))
+            {
+                app.drag_scroll = true;
+                scroll_to(app, m.row, track);
+                return;
+            }
             // inner starts one cell in (border), first content line is the header
             let first_row_y = proc_area.y + 2;
             // last content row sits just above the bottom border
@@ -285,6 +334,163 @@ mod tests {
             frame,
         );
         assert_eq!(app.selected, 1);
+    }
+
+    /// enough procs that the proc panel scrolls at any sane frame size
+    fn overflowing_app() -> App {
+        let mut app = fake_app();
+        app.procs = (0..100)
+            .map(|i| ProcRow {
+                pid: i,
+                name: format!("p{i}"),
+                cpu_pct: 0.0,
+                rss: 0,
+                io_bps: None,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn scrollbar_rect_matches_draw_position() {
+        let frame = Rect::new(0, 0, 80, 40);
+        let app = overflowing_app();
+        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
+        // right border column, one row in from each corner (matches the draw margin)
+        assert_eq!(
+            track,
+            Rect::new(
+                proc_area.right() - 1,
+                proc_area.y + 1,
+                1,
+                proc_area.height - 2
+            )
+        );
+        // border 2 + header 1; the bar only exists once the list overflows
+        let visible = (proc_area.height as usize).saturating_sub(3);
+        assert!(scrollbar_rect(proc_area, visible).is_none());
+        assert!(scrollbar_rect(proc_area, visible + 1).is_some());
+    }
+
+    #[test]
+    fn scrollbar_click_jumps_selection() {
+        let mut app = overflowing_app();
+        let frame = Rect::new(0, 0, 80, 40);
+        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
+        let down = MouseEventKind::Down(MouseButton::Left);
+        app.selected = 5;
+        handle_mouse(&mut app, mouse(down, track.x, track.y), frame);
+        assert_eq!(app.selected, 0);
+        assert!(app.drag_scroll);
+        handle_mouse(
+            &mut app,
+            mouse(down, track.x, track.y + track.height - 1),
+            frame,
+        );
+        assert_eq!(app.selected, app.procs.len() - 1);
+    }
+
+    #[test]
+    fn scrollbar_grab_is_not_a_row_click() {
+        let mut app = overflowing_app();
+        let frame = Rect::new(0, 0, 80, 40);
+        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
+        let len = app.procs.len();
+        // second track row sits on the first data row; a row click would pick
+        // index 0, the track ratio jumps much further down the list
+        let row = track.y + 1;
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), track.x, row),
+            frame,
+        );
+        let mapped = (row - track.y) as usize * (len - 1) / (track.height - 1) as usize;
+        assert_eq!(app.selected, mapped);
+        assert_ne!(app.selected, 0);
+    }
+
+    #[test]
+    fn scrollbar_drag_follows_row_and_release_stops_it() {
+        let mut app = overflowing_app();
+        let frame = Rect::new(0, 0, 80, 40);
+        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
+        let len = app.procs.len();
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), track.x, track.y),
+            frame,
+        );
+        assert!(app.drag_scroll);
+        let mid = track.y + track.height / 2;
+        handle_mouse(&mut app, mouse(drag, track.x, mid), frame);
+        assert_eq!(
+            app.selected,
+            (mid - track.y) as usize * (len - 1) / (track.height - 1) as usize
+        );
+        // pointer wanders off the column mid-drag; the row still drives it
+        handle_mouse(&mut app, mouse(drag, 0, track.y + track.height - 1), frame);
+        assert_eq!(app.selected, len - 1);
+        // above the track clamps to the top
+        handle_mouse(&mut app, mouse(drag, 0, 0), frame);
+        assert_eq!(app.selected, 0);
+        // release outside the panel still ends the drag
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            frame,
+        );
+        assert!(!app.drag_scroll);
+        handle_mouse(
+            &mut app,
+            mouse(drag, track.x, track.y + track.height - 1),
+            frame,
+        );
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn drag_without_grab_is_ignored() {
+        let mut app = overflowing_app();
+        let frame = Rect::new(0, 0, 80, 40);
+        let [_, _, _, proc_area, _] = panels(frame, &app);
+        let track = scrollbar_rect(proc_area, app.procs.len()).unwrap();
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                track.x,
+                track.y + track.height - 1,
+            ),
+            frame,
+        );
+        assert_eq!(app.selected, 0);
+        assert!(!app.drag_scroll);
+    }
+
+    #[test]
+    fn right_border_click_ignored_when_list_fits() {
+        let mut app = fake_app(); // two procs, no scrollbar
+        let frame = Rect::new(0, 0, 80, 40);
+        let [_, _, _, proc_area, _] = panels(frame, &app);
+        assert!(scrollbar_rect(proc_area, app.procs.len()).is_none());
+        // a scrollbar grab here would jump to the last proc; a row click lands
+        // below the two rows and is ignored either way
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                proc_area.right() - 1,
+                proc_area.y + proc_area.height - 2,
+            ),
+            frame,
+        );
+        assert_eq!(app.selected, 0);
+        assert!(!app.drag_scroll);
     }
 
     #[test]

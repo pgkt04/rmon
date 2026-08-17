@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Margin, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -85,7 +85,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 
     // scroll position over the right border, only when the list overflows
-    if app.procs.len() > visible {
+    if let Some(track) = super::scrollbar_rect(area, app.procs.len()) {
         let mut state = ScrollbarState::new(app.procs.len()).position(app.selected);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -95,7 +95,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 .thumb_symbol("█")
                 .track_style(Style::new().fg(theme::BORDER))
                 .thumb_style(Style::new().fg(theme::TITLE)),
-            area.inner(Margin::new(0, 1)),
+            track,
             &mut state,
         );
     }

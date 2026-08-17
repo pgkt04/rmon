@@ -89,6 +89,8 @@ pub struct App {
     pub disks: Vec<DiskRow>,
     pub mounts: Vec<MountInfo>,
     pub selected: usize,
+    /// true while the mouse is dragging the proc scrollbar thumb
+    pub drag_scroll: bool,
     pub sort: SortBy,
     pub status: Option<String>,
     pub bench: Option<BenchState>,
