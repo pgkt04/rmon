@@ -76,8 +76,7 @@ fn scroll_to(app: &mut App, row: u16, track: Rect) {
     }
     // pointer may be above/below the track mid-drag; pin it first
     let row = row.clamp(track.y, track.y + track.height - 1);
-    app.selected =
-        (((row - track.y) as usize * (len - 1)) / (track.height - 1) as usize).min(len - 1);
+    app.select((((row - track.y) as usize * (len - 1)) / (track.height - 1) as usize).min(len - 1));
 }
 
 /// wheel scrolls the proc list, click selects a row, the scrollbar drags
@@ -141,8 +140,8 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
     }
     let last = app.procs.len().saturating_sub(1);
     match m.kind {
-        MouseEventKind::ScrollUp => app.selected = app.selected.saturating_sub(1),
-        MouseEventKind::ScrollDown => app.selected = (app.selected + 1).min(last),
+        MouseEventKind::ScrollUp => app.select(app.selected.saturating_sub(1)),
+        MouseEventKind::ScrollDown => app.select((app.selected + 1).min(last)),
         MouseEventKind::Down(MouseButton::Left) => {
             // grabbing the scrollbar must not select the row under it
             if let Some(track) = scrollbar_rect(proc_area, app.procs.len())
@@ -162,7 +161,7 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent, frame: Rect) {
             let offset = app.selected.saturating_sub(visible.saturating_sub(1));
             let idx = offset + (m.row - first_row_y) as usize;
             if idx < app.procs.len() {
-                app.selected = idx;
+                app.select(idx);
             }
         }
         _ => {}

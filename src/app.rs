@@ -97,6 +97,9 @@ pub struct App {
     pub disks: Vec<DiskRow>,
     pub mounts: Vec<MountInfo>,
     pub selected: usize,
+    /// pid under the highlight; the list resorts every snapshot, so the
+    /// index alone would make the selection wander
+    pub selected_pid: Option<i32>,
     /// true while the mouse is dragging the proc scrollbar thumb
     pub drag_scroll: bool,
     pub sort: SortBy,
@@ -201,21 +204,24 @@ impl App {
         }
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Up => self.select(self.selected.saturating_sub(1)),
             KeyCode::Down => {
-                self.selected = (self.selected + 1).min(self.procs.len().saturating_sub(1));
+                self.select((self.selected + 1).min(self.procs.len().saturating_sub(1)));
             }
             KeyCode::Char('c') => {
                 self.sort = SortBy::Cpu;
                 self.sort_procs();
+                self.reanchor();
             }
             KeyCode::Char('m') => {
                 self.sort = SortBy::Mem;
                 self.sort_procs();
+                self.reanchor();
             }
             KeyCode::Char('i') => {
                 self.sort = SortBy::Io;
                 self.sort_procs();
+                self.reanchor();
             }
             KeyCode::Char('b') => {
                 let running = self
@@ -372,7 +378,7 @@ impl App {
                 .collect();
             push_capped(&mut self.disk_io, total_bps);
             self.sort_procs();
-            self.selected = self.selected.min(self.procs.len().saturating_sub(1));
+            self.reanchor();
         }
         self.mem = s.mem;
         self.mounts = s.mounts.clone();
@@ -400,6 +406,33 @@ impl App {
                 let key = |p: &ProcRow| p.io_bps.unwrap_or(f64::NEG_INFINITY);
                 key(b).total_cmp(&key(a)).then(b.rss.cmp(&a.rss))
             }),
+        }
+    }
+
+    /// move the highlight and remember which process sits under it
+    pub fn select(&mut self, idx: usize) {
+        self.selected = idx;
+        self.selected_pid = self.procs.get(idx).map(|p| p.pid);
+    }
+
+    /// after a resort, chase the anchored pid to its new index. a dead pid
+    /// keeps the old (clamped) spot and adopts whatever sits there now.
+    /// a drag in flight wins over the anchor: the pointer sets the position
+    fn reanchor(&mut self) {
+        if self.drag_scroll {
+            self.selected = self.selected.min(self.procs.len().saturating_sub(1));
+            self.selected_pid = self.procs.get(self.selected).map(|p| p.pid);
+            return;
+        }
+        match self
+            .selected_pid
+            .and_then(|pid| self.procs.iter().position(|p| p.pid == pid))
+        {
+            Some(idx) => self.selected = idx,
+            None => {
+                self.selected = self.selected.min(self.procs.len().saturating_sub(1));
+                self.selected_pid = self.procs.get(self.selected).map(|p| p.pid);
+            }
         }
     }
 }
@@ -621,6 +654,74 @@ mod tests {
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Up)));
         app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Up)));
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn selection_follows_pid_across_resort() {
+        let mut app = App::default();
+        let (a, b) = pair();
+        let base = a.taken;
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        // cpu sort put alpha first; anchor the highlight on beta (pid 2)
+        assert_eq!(app.procs[0].name, "alpha");
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Down)));
+        assert_eq!((app.selected, app.selected_pid), (1, Some(2)));
+
+        // next tick beta burns cpu and alpha idles -> the order flips
+        let mut c = snap(200, 1000);
+        c.taken = base + Duration::from_secs(2);
+        c.procs = vec![
+            ProcessInfo {
+                pid: 1,
+                name: "alpha".into(),
+                cpu_ns: 500_000_000, // unchanged since b -> 0%
+                rss: 100,
+                disk_read: Some(3 << 20),
+                disk_written: Some(1 << 20),
+            },
+            ProcessInfo {
+                pid: 2,
+                name: "beta".into(),
+                cpu_ns: 800_009_999,
+                rss: 9_000,
+                disk_read: None,
+                disk_written: None,
+            },
+        ];
+        app.on_event(AppEvent::Snapshot(c));
+        assert_eq!(app.procs[0].name, "beta");
+        assert_eq!(app.selected, 0, "highlight chased beta to the top");
+        assert_eq!(app.selected_pid, Some(2));
+
+        // beta dies: keep the spot, adopt whoever sits there now
+        let mut d = snap(250, 1050);
+        d.taken = base + Duration::from_secs(3);
+        d.procs = vec![ProcessInfo {
+            pid: 1,
+            name: "alpha".into(),
+            cpu_ns: 500_000_000,
+            rss: 100,
+            disk_read: Some(3 << 20),
+            disk_written: Some(1 << 20),
+        }];
+        app.on_event(AppEvent::Snapshot(d));
+        assert_eq!((app.selected, app.selected_pid), (0, Some(1)));
+    }
+
+    #[test]
+    fn sort_key_keeps_the_selected_pid() {
+        let mut app = App::default();
+        let (a, b) = pair();
+        app.on_event(AppEvent::Snapshot(a));
+        app.on_event(AppEvent::Snapshot(b));
+        // cpu sort: [alpha, beta]; select alpha, then sort by mem flips the order
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Up)));
+        assert_eq!(app.selected_pid, Some(1));
+        app.on_event(AppEvent::Key(KeyEvent::from(KeyCode::Char('m'))));
+        assert_eq!(app.procs[0].name, "beta");
+        assert_eq!(app.selected, 1, "alpha stays highlighted after the resort");
+        assert_eq!(app.selected_pid, Some(1));
     }
 
     #[test]
