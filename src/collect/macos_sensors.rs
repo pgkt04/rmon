@@ -241,6 +241,20 @@ pub fn cpu_temps() -> (Option<f64>, Vec<f64>) {
     (overall, cores)
 }
 
+/// stretch `temps` (one per die sensor, count undocumented and often ≠ ncpu;
+/// e.g. M3 Pro: 10 tdie sensors, 12 logical cpus) onto one reading per
+/// logical cpu so every core row shows a temp. Attribution is approximate:
+/// nearest sensor by proportional index; adjacent cores may share a sensor.
+pub fn spread_core_temps(temps: &[f64], ncpu: usize) -> Vec<f64> {
+    if temps.is_empty() || ncpu == 0 {
+        return Vec::new();
+    }
+    if temps.len() == ncpu {
+        return temps.to_vec();
+    }
+    (0..ncpu).map(|i| temps[i * temps.len() / ncpu]).collect()
+}
+
 /// "Device Utilization %" from the entry's PerformanceStatistics, if present
 fn accel_util(entry: IoObject, stats_key: &Cf, util_key: &Cf) -> Option<f64> {
     // SAFETY: entry is a live registry object; CreateCFProperty -> owned
@@ -324,5 +338,24 @@ mod tests {
             return;
         };
         assert!((0.0..=100.0).contains(&u), "implausible gpu util: {u}");
+    }
+
+    #[test]
+    fn spread_matches_counts() {
+        // fewer sensors than cpus (m3 pro: 10 sensors, 12 cpus) -> every
+        // cpu gets the proportionally nearest sensor, order preserved
+        let temps: Vec<f64> = (0..10).map(|i| 40.0 + i as f64).collect();
+        let out = spread_core_temps(&temps, 12);
+        assert_eq!(out.len(), 12);
+        assert_eq!(out[0], 40.0);
+        assert_eq!(out[11], 49.0);
+        assert!(out.windows(2).all(|w| w[0] <= w[1]));
+
+        // equal counts pass through untouched
+        assert_eq!(spread_core_temps(&temps, 10), temps);
+
+        // no sensors / no cpus -> empty (ui hides the temp column)
+        assert!(spread_core_temps(&[], 8).is_empty());
+        assert!(spread_core_temps(&temps, 0).is_empty());
     }
 }

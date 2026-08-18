@@ -41,8 +41,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// one source of truth for the frame layout; the mouse handler hit-tests with it
 fn panels(area: Rect, app: &App) -> [Rect; 6] {
-    // meters + borders; swap meter only exists when the host has swap
-    let mem_rows = if app.mem.swap_total > 0 { 5 } else { 4 };
     // gpu-less hosts lose zero rows: the panel collapses to nothing
     let gpu_rows = if app.gpu_util_pct.is_some() || !app.gpu_hist.is_empty() {
         5
@@ -58,7 +56,8 @@ fn panels(area: Rect, app: &App) -> [Rect; 6] {
         // the panel stays compact
         Constraint::Length(8),
         Constraint::Fill(3),
-        Constraint::Length(mem_rows),
+        // 3 meters (used/avail/swap) + borders
+        Constraint::Length(5),
     ])
     .areas(area);
     // dsk and proc share the tall middle band; the split keeps
@@ -432,6 +431,20 @@ mod tests {
         assert!(text.contains("swap"));
         assert!(text.contains("3.0 GiB / 4.0 GiB"));
         assert!(text.contains('⣿'));
+    }
+
+    #[test]
+    fn swap_row_shows_even_with_zero_swap() {
+        // macos allocates swap on demand; total 0 must still render the row
+        let backend = TestBackend::new(190, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        app.mem.swap_total = 0;
+        app.mem.swap_used = 0;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("swap"));
+        assert!(text.contains("0 B / 0 B"));
     }
 
     #[test]
