@@ -44,6 +44,8 @@ pub struct MemSnapshot {
     pub available: u64,
     pub swap_total: u64,
     pub swap_used: u64,
+    /// bytes held by the memory compressor; 0 = none or not supported
+    pub compressed: u64,
 }
 
 /// one physical interface's cumulative traffic; loopback is excluded

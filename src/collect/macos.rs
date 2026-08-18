@@ -431,7 +431,7 @@ fn mem_snapshot() -> Result<MemSnapshot, CollectError> {
             0,
         )
     };
-    // no swap info is not fatal; the meter shows 0 B / 0 B
+    // no swap info is not fatal; the meter just stays hidden
     let (swap_total, swap_used) = if rc == 0 {
         (xsw.total, xsw.used)
     } else {
@@ -449,6 +449,8 @@ fn mem_snapshot() -> Result<MemSnapshot, CollectError> {
         available: total.saturating_sub(used),
         swap_total,
         swap_used,
+        // activity monitor's "Compressed": space the compressor pool occupies
+        compressed: vm.compressor_page_count as u64 * page,
     })
 }
 

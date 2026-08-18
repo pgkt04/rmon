@@ -30,12 +30,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             part as f64 * 100.0 / app.mem.total as f64
         }
     };
-    let spct = if app.mem.swap_total == 0 {
-        0.0
-    } else {
-        app.mem.swap_used as f64 * 100.0 / app.mem.swap_total as f64
-    };
-    let lines = vec![
+    let mut lines = vec![
         meter(
             "used ",
             pct(app.mem.used),
@@ -56,10 +51,24 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             ),
             inner.width,
         ),
-        // swap always shows; 0 B / 0 B means the host has none allocated
-        // (macos grows swap on demand, so the row appearing later would jump
-        // the layout)
-        meter(
+    ];
+    // compression pool before swap: macos compresses long before it swaps
+    if app.mem.compressed > 0 {
+        lines.push(meter(
+            "cmprs",
+            pct(app.mem.compressed),
+            &format!(
+                "{:>9} / {}",
+                humanize(app.mem.compressed),
+                humanize(app.mem.total)
+            ),
+            inner.width,
+        ));
+    }
+    // hosts without swap keep the row hidden
+    if app.mem.swap_total > 0 {
+        let spct = app.mem.swap_used as f64 * 100.0 / app.mem.swap_total as f64;
+        lines.push(meter(
             "swap ",
             spct,
             &format!(
@@ -68,7 +77,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 humanize(app.mem.swap_total)
             ),
             inner.width,
-        ),
-    ];
+        ));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
