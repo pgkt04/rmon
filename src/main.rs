@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         let mut collector = collect::new_collector();
         loop {
             let v = collect_pid.load(Relaxed);
-            let ev = match collector.collect((v >= 0).then(|| v as i32)) {
+            let ev = match collector.collect((v >= 0).then_some(v as i32)) {
                 Ok(s) => AppEvent::Snapshot(Box::new(s)),
                 Err(e) => AppEvent::CollectError(e.to_string()),
             };

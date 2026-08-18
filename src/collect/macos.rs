@@ -578,7 +578,7 @@ fn kinfo_sweep() -> Result<Vec<u8>, CollectError> {
         if rc == 0 {
             // a partial trailing record would mean our stride is wrong for
             // this kernel — bail loudly rather than misread every field
-            if len % KINFO_PROC_SIZE != 0 {
+            if !len.is_multiple_of(KINFO_PROC_SIZE) {
                 return Err(CollectError::Sys {
                     call: "sysctl(KERN_PROC_ALL) stride",
                     code: len as i64,

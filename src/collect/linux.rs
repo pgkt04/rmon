@@ -802,9 +802,9 @@ mod tests {
         let ids: Vec<u64> = (0..16).chain(0..16).collect();
         let out = expand_core_temps(&labeled, Some(&ids));
         assert_eq!(out.len(), 32);
-        for cpu in 0..32 {
+        for (cpu, temp) in out.iter().enumerate() {
             // sibling threads share their physical core's temp
-            assert_eq!(out[cpu], 30.0 + (cpu % 16) as f64);
+            assert_eq!(*temp, 30.0 + (cpu % 16) as f64);
         }
     }
 

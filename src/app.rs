@@ -235,9 +235,7 @@ fn cmp_rows(sort: SortBy, a: &ProcRow, b: &ProcRow) -> std::cmp::Ordering {
 /// equal threads from shuffling every tick
 fn sort_threads(sort: SortBy, ts: &mut [ProcRow]) {
     match sort {
-        SortBy::Name => {
-            ts.sort_by(|a, b| (a.name.to_lowercase(), a.tid).cmp(&(b.name.to_lowercase(), b.tid)))
-        }
+        SortBy::Name => ts.sort_by_key(|a| (a.name.to_lowercase(), a.tid)),
         _ => ts.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(a.tid.cmp(&b.tid))),
     }
 }
@@ -1240,7 +1238,6 @@ mod tests {
                 iface("en0", 108_000, 53_500),
                 iface("utun4", 7_000, 3_000),
             ],
-            ..Default::default()
         };
         app.on_event(AppEvent::Snapshot(c));
         let vis: Vec<&str> = app.visible_net().iter().map(|r| r.name.as_str()).collect();
@@ -1257,7 +1254,6 @@ mod tests {
                 iface("en0", 108_000, 53_500),
                 iface("utun4", 7_000, 3_000),
             ],
-            ..Default::default()
         };
         app.on_event(AppEvent::Snapshot(d));
         assert!(app.visible_net().is_empty(), "idle past grace hides");
@@ -1293,11 +1289,10 @@ mod tests {
                 rx_bytes: 1_000,
                 tx_bytes: 500,
             }],
-            ..Default::default()
         };
         app.on_event(AppEvent::Snapshot(c));
-        assert!(app.net_hist.get("eth0").is_none(), "vanished iface pruned");
-        assert!(app.net_hist.get("wlan0").is_some());
+        assert!(!app.net_hist.contains_key("eth0"), "vanished iface pruned");
+        assert!(app.net_hist.contains_key("wlan0"));
     }
 
     #[test]
