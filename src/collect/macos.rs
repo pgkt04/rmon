@@ -221,9 +221,14 @@ pub struct MacCollector;
 impl Collector for MacCollector {
     fn collect(&mut self, threads_for: Option<i32>) -> Result<Snapshot, CollectError> {
         let brand = cached_cpu_brand();
-        let (cpu_temp_c, core_temps_c) = super::macos_sensors::cpu_temps();
+        let cpu = cpu_snapshot()?;
+        let (cpu_temp_c, raw_core_temps) = super::macos_sensors::cpu_temps();
+        // sensor count rarely equals the logical cpu count on apple silicon;
+        // stretch so the ui shows a temp beside every core
+        let core_temps_c =
+            super::macos_sensors::spread_core_temps(&raw_core_temps, cpu.per_core.len());
         Ok(Snapshot {
-            cpu: cpu_snapshot()?,
+            cpu,
             mem: mem_snapshot()?,
             net: net_snapshot()?,
             disks: super::macos_iokit::disks()?,
@@ -444,6 +449,8 @@ fn mem_snapshot() -> Result<MemSnapshot, CollectError> {
         available: total.saturating_sub(used),
         swap_total,
         swap_used,
+        // activity monitor's "Compressed": space the compressor pool occupies
+        compressed: vm.compressor_page_count as u64 * page,
     })
 }
 

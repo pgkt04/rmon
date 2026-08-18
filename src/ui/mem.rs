@@ -52,6 +52,19 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             inner.width,
         ),
     ];
+    // compression pool before swap: macos compresses long before it swaps
+    if app.mem.compressed > 0 {
+        lines.push(meter(
+            "cmprs",
+            pct(app.mem.compressed),
+            &format!(
+                "{:>9} / {}",
+                humanize(app.mem.compressed),
+                humanize(app.mem.total)
+            ),
+            inner.width,
+        ));
+    }
     // hosts without swap keep the row hidden
     if app.mem.swap_total > 0 {
         let spct = app.mem.swap_used as f64 * 100.0 / app.mem.swap_total as f64;

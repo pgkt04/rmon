@@ -44,6 +44,7 @@ pub fn parse_meminfo(s: &str) -> Result<MemSnapshot, CollectError> {
     let mut available = 0u64;
     let mut swap_total = 0u64;
     let mut swap_free = 0u64;
+    let mut zswap = 0u64;
     for line in s.lines() {
         let Some((key, rest)) = line.split_once(':') else {
             continue;
@@ -59,6 +60,8 @@ pub fn parse_meminfo(s: &str) -> Result<MemSnapshot, CollectError> {
             "MemAvailable" => available = kb * 1024,
             "SwapTotal" => swap_total = kb * 1024,
             "SwapFree" => swap_free = kb * 1024,
+            // compressed pool size; the closest analog of macos' compressor
+            "Zswap" => zswap = kb * 1024,
             _ => {}
         }
     }
@@ -71,6 +74,7 @@ pub fn parse_meminfo(s: &str) -> Result<MemSnapshot, CollectError> {
         available,
         swap_total,
         swap_used: swap_total.saturating_sub(swap_free),
+        compressed: zswap,
     })
 }
 
@@ -606,6 +610,7 @@ mod tests {
     fn meminfo_bytes() {
         let m = parse_meminfo(MEMINFO).unwrap();
         assert_eq!(m.total, 16_384_000 * 1024);
+        assert_eq!(m.compressed, 262_144 * 1024);
         assert_eq!(m.available, 8_192_000 * 1024);
         assert_eq!(m.used, m.total - m.available);
         assert_eq!(m.swap_total, 2_097_152 * 1024);

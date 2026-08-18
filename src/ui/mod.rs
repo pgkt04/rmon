@@ -41,8 +41,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// one source of truth for the frame layout; the mouse handler hit-tests with it
 fn panels(area: Rect, app: &App) -> [Rect; 6] {
-    // meters + borders; swap meter only exists when the host has swap
-    let mem_rows = if app.mem.swap_total > 0 { 5 } else { 4 };
+    // used/avail meters + borders, plus optional compressed and swap rows
+    let mem_rows = 4 + u16::from(app.mem.compressed > 0) + u16::from(app.mem.swap_total > 0);
     // gpu-less hosts lose zero rows: the panel collapses to nothing
     let gpu_rows = if app.gpu_util_pct.is_some() || !app.gpu_hist.is_empty() {
         5
@@ -307,6 +307,7 @@ mod tests {
             available: 6 << 30,
             swap_total: 4 << 30,
             swap_used: 3 << 30,
+            compressed: 2 << 30,
         };
         app.net_rx = (0..60).map(|i| (i % 10) as f64 * 200_000.0).collect();
         app.net_tx = (0..60).map(|i| (i % 7) as f64 * 60_000.0).collect();
@@ -429,9 +430,27 @@ mod tests {
         assert!(text.contains("2.0 MiB/s"));
         assert!(text.contains(" mem "));
         assert!(text.contains("10.0 GiB / 16.0 GiB"));
+        assert!(text.contains("cmprs"));
+        assert!(text.contains("2.0 GiB / 16.0 GiB"));
         assert!(text.contains("swap"));
         assert!(text.contains("3.0 GiB / 4.0 GiB"));
         assert!(text.contains('⣿'));
+    }
+
+    #[test]
+    fn zero_swap_and_zero_compressed_hide_their_rows() {
+        // macos reports swap total 0 until it allocates a swapfile; an empty
+        // compressor pool likewise says nothing worth a row
+        let backend = TestBackend::new(190, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        app.mem.swap_total = 0;
+        app.mem.swap_used = 0;
+        app.mem.compressed = 0;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(!text.contains("swap"));
+        assert!(!text.contains("cmprs"));
     }
 
     #[test]
