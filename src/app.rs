@@ -7,9 +7,10 @@ use crate::bench::{BenchEvent, TestKind, TestResult};
 use crate::collect::{MemSnapshot, MountInfo, Snapshot, cpu_percent};
 use crate::smart::SmartInfo;
 
-// braille packs 2 samples per char column: 720 samples fill a 360-col
-// terminal; 300 could never reach the left edge past 150 chars
-pub const HISTORY: usize = 720;
+// braille packs 2 samples per char column, so N samples paint N/2 columns.
+// 1440 covers a 720-col terminal — wider than any sane display; the old 720
+// left blank columns on big screens (a few dozen f64 series, memory is noise)
+pub const HISTORY: usize = 1440;
 
 /// a net/dsk row idle this long stops rendering unless `h` shows it
 pub const IDLE_HIDE_SECS: f64 = 5.0;
