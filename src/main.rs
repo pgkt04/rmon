@@ -16,12 +16,54 @@ use ratatui::crossterm::execute;
 
 use app::{App, AppEvent};
 
+const USAGE: &str = "\
+rmon - terminal system monitor with disk benchmarking
+
+usage:
+    rmon                            run the monitor
+    rmon bench [OPTIONS]            headless disk benchmark
+    rmon --version                  print version
+    rmon --help                     print this help
+
+bench options:
+    --path DIR                      benchmark a filesystem path
+    --device DEV                    read-only raw device test (root)
+    --size-mb N                     size of the test file
+    --secs N                        seconds per random test
+
+keys:
+    q           quit
+    c/m/i/n     sort procs
+    f or /      filter procs
+    t           threads of selected process
+    e           process tree
+    h           show idle interfaces/disks
+    k           kill selected process
+    s           system info
+    + / -       refresh speed
+    b           disk benchmark";
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("bench") {
-        return bench::cli::parse_args(&args[1..])
-            .and_then(|cfg| bench::cli::run_headless(&cfg))
-            .map_err(|e| anyhow::anyhow!(e));
+    match args.first().map(String::as_str) {
+        Some("bench") => {
+            return bench::cli::parse_args(&args[1..])
+                .and_then(|cfg| bench::cli::run_headless(&cfg))
+                .map_err(|e| anyhow::anyhow!(e));
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("rmon {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("-h" | "--help" | "help") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        // an unknown arg used to silently open the tui; say so instead
+        Some(other) => {
+            anyhow::bail!("unknown argument `{other}`\n\n{USAGE}");
+        }
+        None => {}
     }
 
     let (tx, rx) = mpsc::channel();
