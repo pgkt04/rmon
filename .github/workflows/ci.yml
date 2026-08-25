@@ -9,6 +9,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # the installer is the front door, so it must stay posix-clean
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: sh -n install.sh
+      - run: shellcheck -s sh install.sh
+
   test:
     strategy:
       fail-fast: false

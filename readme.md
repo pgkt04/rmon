@@ -15,10 +15,25 @@ iops with latency percentiles. Results append to
 
 Runs on Linux and macOS.
 
+install:
+
+    curl -fsSL https://raw.githubusercontent.com/pgkt04/rmon/main/install.sh | sh
+
+The Linux binaries are static, so they run on any distro regardless of
+glibc version. Builds exist for linux x86_64, linux aarch64, macos arm64,
+and macos x86_64. Set `RMON_BIN_DIR` to choose the install directory and
+`RMON_VERSION` to pin a release.
+
+Or grab a tarball from the [releases
+page](https://github.com/pgkt04/rmon/releases), or build from source:
+
+    cargo install --git https://github.com/pgkt04/rmon
+
 usage:
 
     rmon
     rmon bench [--path DIR | --device DEV] [--size-mb N] [--secs N]
+    rmon --help
 
 keys:
 

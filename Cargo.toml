@@ -1,7 +1,16 @@
 [package]
 name = "rmon"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Terminal system monitor with disk benchmarking"
+license = "MIT"
+repository = "https://github.com/pgkt04/rmon"
+
+# release binaries get downloaded, so trade build time for size/speed
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
 
 [dependencies]
 anyhow = "1.0.104"

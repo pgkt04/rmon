@@ -12,25 +12,76 @@ on:
 permissions:
   contents: write
 
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # musl = static binary, so it runs on any glibc, any distro
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
             triple: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            triple: linux-aarch64
           - os: macos-latest
+            target: aarch64-apple-darwin
             triple: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            triple: macos-x86_64
     runs-on: ${{ matrix.os }}
-    env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
-      - run: cargo build --release
-      - run: tar -C target/release -czf rmon-$TAG-${{ matrix.triple }}.tar.gz rmon
+        with:
+          key: ${{ matrix.target }}
+      # musl-gcc is the linker driver for the musl targets
+      - if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # only the host-native targets can run their own tests
+      - if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --target ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: verify the linux binaries are static
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          bin=target/${{ matrix.target }}/release/rmon
+          file "$bin"
+          # x86_64 comes out "static-pie linked", aarch64 "statically linked";
+          # both are fine, a dynamic one is not
+          file "$bin" | grep -Eq 'static-pie linked|statically linked' ||
+            { echo "::error::$bin is not statically linked"; exit 1; }
+      - run: tar -C target/${{ matrix.target }}/release -czf rmon-$TAG-${{ matrix.triple }}.tar.gz rmon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmon-${{ matrix.triple }}
+          path: rmon-${{ env.TAG }}-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    # one job owns the release, so the build matrix cannot race on creating it
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
-          files: rmon-${{ env.TAG }}-${{ matrix.triple }}.tar.gz
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
