@@ -242,6 +242,7 @@ impl Collector for MacCollector {
             gpu_util_pct: super::macos_sensors::gpu_util(),
             load_avg: super::load_avg(),
             uptime_secs: uptime_secs(),
+            battery: super::macos_iokit::battery(),
             taken: std::time::Instant::now(),
         })
     }
@@ -857,6 +858,22 @@ mod tests {
         let me = std::process::id() as i32;
         let p = s.procs.iter().find(|p| p.pid == me).unwrap();
         assert!(p.disk_read.is_some() && p.disk_written.is_some());
+    }
+
+    #[test]
+    fn battery_values_are_sane_when_present() {
+        // desktops legitimately return None; on laptops the numbers must hold
+        let mut c = MacCollector;
+        let s = c.collect(None).unwrap();
+        if let Some(b) = s.battery {
+            assert!((0.0..=100.0).contains(&b.percent));
+            if let Some(w) = b.watts {
+                assert!((0.0..500.0).contains(&w), "watts insane: {w}");
+            }
+            if let Some(t) = b.secs_left {
+                assert!(t < 7 * 24 * 3600, "secs_left insane: {t}");
+            }
+        }
     }
 
     #[test]

@@ -386,6 +386,12 @@ mod tests {
         app.net_tx_total = 800 << 20;
         app.load_avg = Some([2.14, 1.82, 1.53]);
         app.uptime_secs = Some(93_784);
+        app.battery = Some(crate::collect::BatterySnapshot {
+            percent: 61.0,
+            state: crate::collect::BatteryState::Discharging,
+            secs_left: Some(2 * 3600 + 30 * 60),
+            watts: Some(12.34),
+        });
         app
     }
 
@@ -435,6 +441,33 @@ mod tests {
         assert!(text.contains("swap"));
         assert!(text.contains("3.0 GiB / 4.0 GiB"));
         assert!(text.contains('⣿'));
+    }
+
+    #[test]
+    fn battery_in_cpu_title_and_absent_without_one() {
+        let backend = TestBackend::new(190, 46);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = fake_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        // label + a 10-cell meter, 61% -> 6 filled + 4 empty, then time + watts
+        assert!(text.contains("BAT▼ 61% ⣿⣿⣿⣿⣿⣿⣀⣀⣀⣀ 2h 30m 12.3W"));
+        let buf = term.backend().buffer();
+        // find() would give a byte offset; borders/braille are multibyte,
+        // so locate the cell by scanning the row
+        let x = (0..buf.area.width)
+            .find(|&x| buf[(x, 0)].symbol() == "B")
+            .unwrap();
+        let meter_x = x + 9; // "BAT▼ 61% " is 9 cells
+        let filled = buf[(meter_x, 0)].style().fg;
+        let empty = buf[(meter_x + 9, 0)].style().fg;
+        // filled cells carry the gradient, red end first; the tail is dark
+        assert_eq!(filled, Some(theme::gradient(90.0)));
+        assert_eq!(empty, Some(theme::METER_EMPTY));
+        // desktops have no battery; the title segment disappears entirely
+        app.battery = None;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&term).contains("BAT"));
     }
 
     #[test]

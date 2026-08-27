@@ -175,6 +175,8 @@ pub struct App {
     pub gpu_hist: VecDeque<f64>,
     pub load_avg: Option<[f64; 3]>,
     pub uptime_secs: Option<u64>,
+    /// None = no battery on this machine
+    pub battery: Option<crate::collect::BatterySnapshot>,
     pub net_ifaces: Vec<NetRow>,
     /// per-interface rate history keyed by name: (rx, tx), HISTORY-capped;
     /// vanished interfaces are pruned so hotplug churn cannot leak
@@ -749,6 +751,7 @@ impl App {
         }
         self.load_avg = s.load_avg;
         self.uptime_secs = s.uptime_secs;
+        self.battery = s.battery;
         self.net_rx_total = s.net.rx_bytes;
         self.net_tx_total = s.net.tx_bytes;
         self.status = None;

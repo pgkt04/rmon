@@ -1,9 +1,10 @@
-//! whole-disk io counters from the IORegistry: iterate IOMedia (Whole=true),
-//! read the parent IOBlockStorageDriver's Statistics dictionary
+//! IORegistry readers: whole-disk io counters (iterate IOMedia with Whole=true,
+//! read the parent IOBlockStorageDriver's Statistics dictionary) and the
+//! AppleSmartBattery charge state
 
 use libc::{c_char, c_int, c_uint, c_void};
 
-use super::{CollectError, DiskStats};
+use super::{BatterySnapshot, BatteryState, CollectError, DiskStats};
 
 type CFRef = *const c_void;
 type IoObject = c_uint;
@@ -68,13 +69,23 @@ fn dict_get(d: CFRef, key: &str) -> CFRef {
 }
 
 fn num(v: CFRef) -> Option<u64> {
+    signed_num(v).map(|n| n as u64)
+}
+
+/// Amperage is negative while discharging; keep the sign
+fn signed_num(v: CFRef) -> Option<i64> {
     if v.is_null() {
         return None;
     }
     let mut out: i64 = 0;
-    // SAFETY: v is a CFNumber from the Statistics dict; out matches SINT64
+    // SAFETY: v is a CFNumber; out matches SINT64
     let ok = unsafe { CFNumberGetValue(v, SINT64, &mut out as *mut _ as *mut c_void) };
-    (ok != 0).then_some(out as u64)
+    (ok != 0).then_some(out)
+}
+
+fn boolean(v: CFRef) -> Option<bool> {
+    // SAFETY: v is a CFBoolean when present; checked non-null
+    (!v.is_null()).then(|| unsafe { CFBooleanGetValue(v) } != 0)
 }
 
 fn string(v: CFRef) -> Option<String> {
@@ -177,4 +188,76 @@ pub fn disks() -> Result<Vec<DiskStats>, CollectError> {
     // SAFETY: it obtained from GetMatchingServices
     unsafe { IOObjectRelease(it) };
     Ok(out)
+}
+
+/// AppleSmartBattery registry entry; desktops have none -> None.
+/// Property names verified with `ioreg -rn AppleSmartBattery` on an M1.
+pub fn battery() -> Option<BatterySnapshot> {
+    // SAFETY: literal service name; the matching dict is consumed by GetMatchingServices
+    let matching = unsafe { IOServiceMatching(c"AppleSmartBattery".as_ptr()) };
+    let mut it: IoObject = 0;
+    // SAFETY: port 0 = kIOMainPortDefault; it is an out-param
+    if unsafe { IOServiceGetMatchingServices(0, matching, &mut it) } != 0 {
+        return None;
+    }
+    let mut out = None;
+    loop {
+        // SAFETY: it is a live iterator from the call above
+        let svc = unsafe { IOIteratorNext(it) };
+        if svc == 0 {
+            break;
+        }
+        if out.is_none()
+            && let Some(props) = Props::of(svc)
+        {
+            out = read_battery(props.0);
+        }
+        // SAFETY: svc obtained from IOIteratorNext
+        unsafe { IOObjectRelease(svc) };
+    }
+    // SAFETY: it obtained from GetMatchingServices
+    unsafe { IOObjectRelease(it) };
+    out
+}
+
+fn read_battery(d: CFRef) -> Option<BatterySnapshot> {
+    // apple silicon reports MaxCapacity=100 (so CurrentCapacity is already a
+    // percent); intel machines report raw mAh — the ratio covers both
+    let current = num(dict_get(d, "CurrentCapacity"))? as f64;
+    let max = num(dict_get(d, "MaxCapacity")).filter(|m| *m > 0)? as f64;
+    let percent = (current * 100.0 / max).clamp(0.0, 100.0);
+
+    let charging = boolean(dict_get(d, "IsCharging")).unwrap_or(false);
+    let full = boolean(dict_get(d, "FullyCharged")).unwrap_or(false);
+    let external = boolean(dict_get(d, "ExternalConnected")).unwrap_or(false);
+    // mA; negative = current actually leaving the battery
+    let amperage = signed_num(dict_get(d, "Amperage"));
+    let state = if charging {
+        BatteryState::Charging
+    } else if !external || amperage.is_some_and(|a| a < 0) {
+        // on battery, or on ac with the load outrunning the adapter
+        BatteryState::Discharging
+    } else if full {
+        BatteryState::Full
+    } else {
+        // on ac, zero current: charge limiter or thermal hold
+        BatteryState::Unknown
+    };
+
+    // minutes to empty or to full depending on state; 65535 = still calculating
+    let secs_left = num(dict_get(d, "TimeRemaining"))
+        .filter(|m| (1..0xFFFF).contains(m))
+        .map(|m| m * 60);
+    // mA * mV / 1e6 = W
+    let watts = match (amperage, signed_num(dict_get(d, "Voltage"))) {
+        (Some(a), Some(v)) => Some((a as f64 * v as f64 / 1e6).abs()),
+        _ => None,
+    };
+
+    Some(BatterySnapshot {
+        percent,
+        state,
+        secs_left,
+        watts,
+    })
 }

@@ -8,6 +8,7 @@ use super::fmt::duration_short;
 use super::meter::meter;
 use super::{BrailleGraph, theme};
 use crate::app::App;
+use crate::collect::BatteryState;
 
 /// per-column width inside the core overlay: `c00 ⣿⣿⣀… 46.6%`
 const CORE_COL_W: u16 = 24;
@@ -39,6 +40,42 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             format!("up {} ", duration_short(up)),
             Style::new().fg(theme::LABEL),
         ));
+    }
+    // btop-style battery: `BAT▼ 80% ⣿⣿⣿⣿⣿⣿⣿⣿⣀⣀ 2h 30m 12.3W`; ▲ charging
+    // ▼ discharging ■ full ○ held on ac at zero current. absent on desktops
+    if let Some(b) = app.battery {
+        let sym = match b.state {
+            BatteryState::Charging => '▲',
+            BatteryState::Discharging => '▼',
+            BatteryState::Full => '■',
+            BatteryState::Unknown => '○',
+        };
+        title.push(Span::styled(
+            format!("BAT{sym} {:.0}% ", b.percent),
+            Style::new().fg(theme::TITLE).add_modifier(Modifier::BOLD),
+        ));
+        // 10-cell meter in the house braille style, gradient reversed so
+        // the low-charge end burns red
+        const BAT_METER_W: usize = 10;
+        for i in 1..=BAT_METER_W {
+            let y = (i as f64 * 100.0 / BAT_METER_W as f64).round();
+            let (glyph, style) = if b.percent >= y {
+                ("⣿", Style::new().fg(theme::gradient(100.0 - y)))
+            } else {
+                ("⣀", Style::new().fg(theme::METER_EMPTY))
+            };
+            title.push(Span::styled(glyph, style));
+        }
+        let mut rest = String::new();
+        if let Some(secs) = b.secs_left {
+            rest.push_str(&format!(" {}", duration_short(secs)));
+        }
+        // idle on ac reads ~0 W; noise, not information
+        if let Some(w) = b.watts.filter(|w| *w >= 0.05) {
+            rest.push_str(&format!(" {w:.1}W"));
+        }
+        rest.push(' ');
+        title.push(Span::styled(rest, Style::new().fg(theme::TITLE)));
     }
     // current refresh cadence, so +/- has visible feedback
     let upd = app.refresh_ms();

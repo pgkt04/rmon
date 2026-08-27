@@ -115,6 +115,26 @@ pub struct ProcessInfo {
     pub threads: Vec<ThreadInfo>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatteryState {
+    Charging,
+    Discharging,
+    Full,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BatterySnapshot {
+    /// charge 0..=100
+    pub percent: f64,
+    pub state: BatteryState,
+    /// secs to empty (discharging) or to full (charging); None = no estimate
+    pub secs_left: Option<u64>,
+    /// instantaneous draw in watts; None when the platform lacks it
+    pub watts: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub cpu: CpuSnapshot,
@@ -132,6 +152,8 @@ pub struct Snapshot {
     pub gpu_util_pct: Option<f64>,
     pub load_avg: Option<[f64; 3]>,
     pub uptime_secs: Option<u64>,
+    /// None = no battery (desktops) or nothing readable
+    pub battery: Option<BatterySnapshot>,
     pub taken: Instant,
 }
 
@@ -151,6 +173,7 @@ impl Default for Snapshot {
             gpu_util_pct: None,
             load_avg: None,
             uptime_secs: None,
+            battery: None,
             taken: Instant::now(),
         }
     }

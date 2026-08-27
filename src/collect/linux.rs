@@ -1,6 +1,6 @@
 use super::{
-    CollectError, CpuSnapshot, CpuTimes, DiskStats, MemSnapshot, NetIface, NetSnapshot,
-    ProcessInfo, ThreadInfo,
+    BatterySnapshot, BatteryState, CollectError, CpuSnapshot, CpuTimes, DiskStats, MemSnapshot,
+    NetIface, NetSnapshot, ProcessInfo, ThreadInfo,
 };
 #[cfg(target_os = "linux")]
 use super::{Collector, MountInfo, Snapshot};
@@ -453,9 +453,114 @@ pub fn read_drm_gpu(base: &std::path::Path) -> Option<(String, f64)> {
     None
 }
 
+/// numeric content of one sysfs file
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_num(p: &std::path::Path) -> Option<f64> {
+    std::fs::read_to_string(p)
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
+/// `base`/<dir>/type content, e.g. "Battery", "Mains", "UPS"
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn supply_type(dir: &std::path::Path) -> Option<String> {
+    // `present` = 0 means an empty battery bay; treat as no supply at all
+    if read_num(&dir.join("present")) == Some(0.0) {
+        return None;
+    }
+    Some(
+        std::fs::read_to_string(dir.join("type"))
+            .ok()?
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// scan `base` (/sys/class/power_supply) for the first Battery (UPS as
+/// fallback), btop-style. Desktops without one -> None
+/// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-class-power
+// Only called by the cfg(linux) LinuxCollector, but unit-tested on every OS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn read_power_supply(base: &std::path::Path) -> Option<BatterySnapshot> {
+    let mut dirs: Vec<_> = std::fs::read_dir(base)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    dirs.sort(); // BAT0 beats BAT1; read_dir order is arbitrary
+    let bat = dirs
+        .iter()
+        .find(|d| supply_type(d).as_deref() == Some("Battery"))
+        .or_else(|| {
+            dirs.iter()
+                .find(|d| supply_type(d).as_deref() == Some("UPS"))
+        })?;
+    read_battery_dir(bat)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_battery_dir(dir: &std::path::Path) -> Option<BatterySnapshot> {
+    let num = |name: &str| read_num(&dir.join(name));
+    let pct_of = |now: Option<f64>, full: Option<f64>| -> Option<f64> {
+        let (n, f) = (now?, full?);
+        (f > 0.0).then(|| n * 100.0 / f)
+    };
+    // stored energy (µWh) or charge (µAh) with the matching rate (µW / µA);
+    // drivers expose one family or the other
+    let (now, full, rate) =
+        if let (n @ Some(_), f @ Some(_)) = (num("energy_now"), num("energy_full")) {
+            (n, f, num("power_now"))
+        } else {
+            (num("charge_now"), num("charge_full"), num("current_now"))
+        };
+    let percent = num("capacity")
+        .or_else(|| pct_of(now, full))?
+        .clamp(0.0, 100.0);
+
+    let status = std::fs::read_to_string(dir.join("status"))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let state = match status.as_str() {
+        "charging" => BatteryState::Charging,
+        "discharging" => BatteryState::Discharging,
+        "full" => BatteryState::Full,
+        // "not charging" at 100% is effectively full
+        _ if percent >= 100.0 => BatteryState::Full,
+        _ => BatteryState::Unknown,
+    };
+
+    // rate signs vary per driver; magnitude is what we want
+    let rate = rate.map(f64::abs).filter(|r| *r > 0.0);
+    let secs = |amount: f64| rate.map(|r| (amount / r * 3600.0) as u64);
+    let secs_left = match state {
+        BatteryState::Discharging => now
+            .and_then(secs)
+            // some drivers estimate directly; the ABI says seconds
+            .or_else(|| num("time_to_empty_now").map(|s| s as u64)),
+        BatteryState::Charging => full
+            .and_then(|f| secs((f - now?).max(0.0)))
+            .or_else(|| num("time_to_full_now").map(|s| s as u64)),
+        _ => None,
+    };
+
+    // power_now is µW; otherwise µA * µV / 1e12 = W
+    let watts = num("power_now")
+        .map(|p| p.abs() / 1e6)
+        .or_else(|| Some((num("current_now")? * num("voltage_now")? / 1e12).abs()));
+
+    Some(BatterySnapshot {
+        percent,
+        state,
+        secs_left,
+        watts,
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub struct LinuxCollector;
-
 #[cfg(target_os = "linux")]
 impl Collector for LinuxCollector {
     fn collect(&mut self, threads_for: Option<i32>) -> Result<Snapshot, CollectError> {
@@ -550,6 +655,7 @@ impl Collector for LinuxCollector {
             uptime_secs: std::fs::read_to_string("/proc/uptime")
                 .ok()
                 .and_then(|s| parse_uptime(&s)),
+            battery: read_power_supply(std::path::Path::new("/sys/class/power_supply")),
             taken: std::time::Instant::now(),
         })
     }
@@ -870,5 +976,109 @@ mod tests {
         let empty = scratch("drm_empty");
         std::fs::create_dir_all(empty.join("card0/device")).unwrap();
         assert_eq!(read_drm_gpu(&empty), None);
+    }
+
+    #[test]
+    fn battery_discharging_energy_units() {
+        // typical laptop: energy_* in µWh, power_now in µW
+        let base = scratch("bat_energy");
+        let bat = base.join("BAT0");
+        std::fs::create_dir_all(&bat).unwrap();
+        std::fs::write(bat.join("type"), "Battery\n").unwrap();
+        std::fs::write(bat.join("present"), "1\n").unwrap();
+        std::fs::write(bat.join("status"), "Discharging\n").unwrap();
+        std::fs::write(bat.join("capacity"), "42\n").unwrap();
+        std::fs::write(bat.join("energy_now"), "20000000\n").unwrap();
+        std::fs::write(bat.join("energy_full"), "50000000\n").unwrap();
+        std::fs::write(bat.join("power_now"), "10000000\n").unwrap();
+        let b = read_power_supply(&base).unwrap();
+        assert_eq!(b.percent, 42.0);
+        assert_eq!(b.state, BatteryState::Discharging);
+        // 20 Wh at 10 W -> 2 h
+        assert_eq!(b.secs_left, Some(7200));
+        assert_eq!(b.watts, Some(10.0));
+    }
+
+    #[test]
+    fn battery_charging_charge_units_without_capacity() {
+        // charge_* µAh + current_now µA; no capacity file -> derived percent
+        let base = scratch("bat_charge");
+        let bat = base.join("BAT1");
+        std::fs::create_dir_all(&bat).unwrap();
+        std::fs::write(bat.join("type"), "Battery\n").unwrap();
+        std::fs::write(bat.join("status"), "Charging\n").unwrap();
+        std::fs::write(bat.join("charge_now"), "1500000\n").unwrap();
+        std::fs::write(bat.join("charge_full"), "3000000\n").unwrap();
+        std::fs::write(bat.join("current_now"), "1500000\n").unwrap();
+        std::fs::write(bat.join("voltage_now"), "12000000\n").unwrap();
+        let b = read_power_supply(&base).unwrap();
+        assert_eq!(b.percent, 50.0);
+        assert_eq!(b.state, BatteryState::Charging);
+        // 1.5 Ah missing at 1.5 A -> 1 h
+        assert_eq!(b.secs_left, Some(3600));
+        // 1.5 A * 12 V
+        assert_eq!(b.watts, Some(18.0));
+    }
+
+    #[test]
+    fn battery_prefers_battery_over_ups_and_skips_mains() {
+        let base = scratch("bat_pick");
+        for (dir, ty, cap) in [
+            ("AC", "Mains", ""),
+            ("ups0", "UPS", "88"),
+            ("zBAT", "Battery", "55"),
+        ] {
+            let d = base.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("type"), ty).unwrap();
+            if !cap.is_empty() {
+                std::fs::write(d.join("capacity"), cap).unwrap();
+                std::fs::write(d.join("status"), "Full").unwrap();
+            }
+        }
+        // zBAT sorts after ups0 but Battery type still wins
+        let b = read_power_supply(&base).unwrap();
+        assert_eq!(b.percent, 55.0);
+        assert_eq!(b.state, BatteryState::Full);
+        assert_eq!(b.secs_left, None);
+    }
+
+    #[test]
+    fn battery_absent_or_not_present_is_none() {
+        // desktop: only a Mains supply
+        let base = scratch("bat_none");
+        let ac = base.join("AC");
+        std::fs::create_dir_all(&ac).unwrap();
+        std::fs::write(ac.join("type"), "Mains\n").unwrap();
+        assert_eq!(read_power_supply(&base), None);
+        // empty battery bay: present = 0
+        let bat = base.join("BAT0");
+        std::fs::create_dir_all(&bat).unwrap();
+        std::fs::write(bat.join("type"), "Battery\n").unwrap();
+        std::fs::write(bat.join("present"), "0\n").unwrap();
+        std::fs::write(bat.join("capacity"), "99\n").unwrap();
+        assert_eq!(read_power_supply(&base), None);
+        // missing base dir entirely
+        assert_eq!(read_power_supply(&base.join("nope")), None);
+    }
+
+    #[test]
+    fn battery_time_estimate_files_and_unknown_status() {
+        // no energy/charge pair at all: capacity + driver time estimates only
+        let base = scratch("bat_est");
+        let bat = base.join("BAT0");
+        std::fs::create_dir_all(&bat).unwrap();
+        std::fs::write(bat.join("type"), "Battery\n").unwrap();
+        std::fs::write(bat.join("status"), "Discharging\n").unwrap();
+        std::fs::write(bat.join("capacity"), "30\n").unwrap();
+        std::fs::write(bat.join("time_to_empty_now"), "5400\n").unwrap();
+        let b = read_power_supply(&base).unwrap();
+        assert_eq!(b.secs_left, Some(5400));
+        assert_eq!(b.watts, None);
+        // garbled status at 100% reads as full
+        std::fs::write(bat.join("status"), "Not charging\n").unwrap();
+        std::fs::write(bat.join("capacity"), "100\n").unwrap();
+        let b = read_power_supply(&base).unwrap();
+        assert_eq!(b.state, BatteryState::Full);
     }
 }
