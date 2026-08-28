@@ -4,6 +4,7 @@ mod collect;
 mod fetch;
 mod smart;
 mod ui;
+mod update;
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, mpsc};
@@ -22,6 +23,7 @@ rmon - terminal system monitor with disk benchmarking
 usage:
     rmon                            run the monitor
     rmon bench [OPTIONS]            headless disk benchmark
+    rmon update                     update to the latest release
     rmon --version                  print version
     rmon --help                     print this help
 
@@ -50,6 +52,9 @@ fn main() -> Result<()> {
             return bench::cli::parse_args(&args[1..])
                 .and_then(|cfg| bench::cli::run_headless(&cfg))
                 .map_err(|e| anyhow::anyhow!(e));
+        }
+        Some("update") => {
+            return update::run().map_err(|e| anyhow::anyhow!(e));
         }
         Some("-V" | "--version" | "version") => {
             println!("rmon {}", env!("CARGO_PKG_VERSION"));

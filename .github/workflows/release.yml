@@ -37,6 +37,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: tag must match Cargo.toml, or --version lies and self-update loops
+        run: |
+          crate="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "$crate" = "$TAG" ] ||
+            { echo "::error::tag $TAG != Cargo.toml $crate"; exit 1; }
       - run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:

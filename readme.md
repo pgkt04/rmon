@@ -29,10 +29,15 @@ page](https://github.com/pgkt04/rmon/releases), or build from source:
 
     cargo install --git https://github.com/pgkt04/rmon
 
+update an existing install (or just re-run the install one-liner):
+
+    rmon update
+
 usage:
 
     rmon
     rmon bench [--path DIR | --device DEV] [--size-mb N] [--secs N]
+    rmon update
     rmon --help
 
 keys:
