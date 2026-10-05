@@ -349,7 +349,7 @@ fn cpu_snapshot() -> Result<CpuSnapshot, CollectError> {
     let ticks = unsafe { std::slice::from_raw_parts(info, info_count as usize) };
     let mut total = CpuTimes::default();
     let mut per_core = Vec::with_capacity(ncpu as usize);
-    for chunk in ticks.chunks_exact(CPU_STATE_MAX) {
+    for chunk in ticks.as_chunks::<CPU_STATE_MAX>().0 {
         // ticks are u32 in the kernel; going through u32 avoids sign-extension at counter wrap
         let t = CpuTimes {
             busy: chunk[CPU_STATE_USER] as u32 as u64
@@ -612,7 +612,7 @@ fn procs_snapshot(threads_for: Option<i32>) -> Result<Vec<ProcessInfo>, CollectE
     let (numer, denom) = (tb.numer.max(1) as u128, tb.denom.max(1) as u128);
 
     let mut procs = Vec::with_capacity(table.len() / KINFO_PROC_SIZE);
-    for rec in table.chunks_exact(KINFO_PROC_SIZE) {
+    for rec in table.as_chunks::<KINFO_PROC_SIZE>().0 {
         let pid = i32::from_ne_bytes(rec[KINFO_P_PID..KINFO_P_PID + 4].try_into().unwrap());
         if pid <= 0 {
             continue; // kernel_task's pid 0
