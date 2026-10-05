@@ -83,7 +83,10 @@ mod metric {
 const CORE_CELLS: usize = 26;
 const GPU_ROWS: usize = 3;
 /// the ratatui net panel: 8 rows less its borders
-const NET_ROWS: usize = 6;
+const NET_LINES: usize = 6;
+/// braille rows per interface spark: 8 dot levels, so a quiet second still
+/// reads as a step instead of rounding to nothing
+const SPARK_ROWS: usize = 2;
 const MOUNT_ROWS: usize = 6;
 /// the fewest proc rows worth a band
 const PROC_MIN: usize = 5;
@@ -100,9 +103,13 @@ struct Plan {
     /// ratatui panel; else they sit under the graph
     cores_mid: bool,
     box_cells: usize,
+    /// the box's height in graph rows; the graph shows above and below it
+    box_lines: usize,
     gpu_cells: usize,
     gpu_rows: usize,
+    /// the net card's body lines, and braille rows in each interface's sparks
     net_rows: usize,
+    spark_rows: usize,
     spark_cells: usize,
     band: f64,
     proc_rows: usize,
@@ -130,9 +137,11 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
         .find(|k| n.div_ceil(*k) + load <= target)
         .unwrap_or(8);
     let core_lines = n.div_ceil(core_cols) + load;
-    // a headless card: the meters plus 12px of padding a side, 10px over and under
+    // a headless card a whole number of graph rows tall, so the graph rows
+    // above and below it stay on their grid: the meters plus 10px of padding
+    // over them and 6px under, and 12px a side
     let box_cells = core_cols * CORE_CELLS + 4;
-    let box_lines = (core_lines as f64 + 20.0 / LINE_PX).ceil() as usize;
+    let box_lines = core_lines + 1;
     let cores_mid = core_lines > 0 && inner >= box_cells + 20;
     let graph_cells = inner;
     let graph_min = if cores_mid { box_lines.max(3) } else { 3 };
@@ -185,17 +194,20 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     let proc_min = CARD + filter + ROW + INNER_GAP + ROW * PROC_MIN as f64;
     let band_min = left_min.max(proc_min).ceil();
 
-    // short panes give up cpu graph rows, then the gpu and net rows; only a
-    // pane too short for every minimum scrolls
+    // short panes give up cpu graph rows, then the gpu rows, then spark
+    // height, then net rows; only a pane too short for every minimum scrolls
     let mut graph_rows = target.max(graph_min);
     let mut gpu_rows = GPU_ROWS;
-    let mut net_rows = app.visible_net().len().clamp(1, NET_ROWS);
+    let mut spark_rows = SPARK_ROWS;
+    let ifaces = app.visible_net().len().max(1);
+    let mut net_cap = NET_LINES;
+    let net_lines = |spark: usize, cap: usize| (ifaces * spark).min(cap).max(spark.min(cap));
     let band = loop {
         let mut used = DOCK + MAIN_PAD + cpu_card(graph_rows);
         if has_gpu {
             used += CARD + gpu_rows as f64 + BLOCK_GAP;
         }
-        used += CARD + net_rows as f64 + BLOCK_GAP;
+        used += CARD + net_lines(spark_rows, net_cap) as f64 + BLOCK_GAP;
         // the band takes what is left, fraction and all: its rows fill the pane
         let band = rows - used;
         let short = band_min - band;
@@ -208,12 +220,15 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
                 .max(graph_min);
         } else if has_gpu && gpu_rows > 1 {
             gpu_rows = 1;
-        } else if net_rows > 1 {
-            net_rows = 1;
+        } else if spark_rows > 1 {
+            spark_rows = 1;
+        } else if net_cap > 1 {
+            net_cap = 1;
         } else {
             break band_min;
         }
     };
+    let net_rows = net_lines(spark_rows, net_cap);
 
     let proc_rows = (((band - CARD - filter - ROW - INNER_GAP) / ROW).floor() as usize).max(3);
     // spare dsk lines go to disk rows first, then to the io graph
@@ -234,11 +249,13 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
         core_cols,
         cores_mid,
         box_cells,
+        box_lines,
         gpu_cells: inner,
         gpu_rows,
         net_rows,
-        // name, two rates and the gaps between them take 41 cells
-        spark_cells: inner.saturating_sub(41) / 2,
+        spark_rows,
+        // the name, two 14-cell rates and the gaps between them take 43 cells
+        spark_cells: inner.saturating_sub(43) / 2,
         band,
         proc_rows,
         disk_rows,
@@ -373,6 +390,20 @@ fn text(id: impl Into<String>, spans: Vec<Value>) -> Node {
     Node::new(id, "text").prop("spans", spans)
 }
 
+/// the widest `rate` gives: "1023.9 MiB/s"
+const RATE_W: usize = 12;
+
+/// `s` right-aligned in `w` cells, padded with no-break spaces: table
+/// cells, card heads and meter labels collapse plain ones, and a number
+/// that changes width would move everything after it on every tick
+fn right(s: impl std::fmt::Display, w: usize) -> String {
+    format!("{s:\u{a0}>w$}")
+}
+
+fn left(s: impl std::fmt::Display, w: usize) -> String {
+    format!("{s:\u{a0}<w$}")
+}
+
 /// the same green/yellow/red split the ratatui gradient makes
 fn load_tone(pct: f64) -> &'static str {
     if pct >= 80.0 {
@@ -417,9 +448,15 @@ fn graph(
     ink: Ink,
 ) -> Node {
     let (grid, col_pct) = graph_grid(hist, max, cells, rows);
-    graph_cols(cx, id, &grid, &col_pct, &ink, 0..cells)
+    Node::new(id, "col").prop("align", "end").children(
+        grid.iter()
+            .enumerate()
+            .map(|(r, line)| graph_row(cx, &format!("{id}.{r}"), line, &col_pct, &ink, 0..cells)),
+    )
 }
 
+/// a rate graph (no fixed `max`) draws any traffic at all as at least its
+/// bottom dot: next to a burst, a trickle would round to an empty column
 fn graph_grid(
     hist: &VecDeque<f64>,
     max: Option<f64>,
@@ -427,48 +464,55 @@ fn graph_grid(
     rows: usize,
 ) -> (Vec<Vec<char>>, Vec<f64>) {
     let take = hist.len().min(cells * 2);
-    let vals: Vec<f64> = hist.iter().skip(hist.len() - take).copied().collect();
-    let max = max.unwrap_or_else(|| vals.iter().copied().fold(1024.0, f64::max) * 1.1);
+    let mut vals: Vec<f64> = hist.iter().skip(hist.len() - take).copied().collect();
+    let max = match max {
+        Some(m) => m,
+        None => {
+            let m = vals.iter().copied().fold(1024.0, f64::max) * 1.1;
+            let dot = m * 0.5 / (rows * 4).max(1) as f64;
+            for v in vals.iter_mut().filter(|v| **v > 0.0) {
+                *v = v.max(dot);
+            }
+            m
+        }
+    };
     braille_grid(&vals, max, cells, rows)
 }
 
-/// cell columns `cols` of a graph grid as a column of text rows
-fn graph_cols(
+/// cell columns `cols` of one graph row as a text node
+fn graph_row(
     cx: &Ctx,
     id: &str,
-    grid: &[Vec<char>],
+    line: &[char],
     col_pct: &[f64],
     ink: &Ink,
     cols: std::ops::Range<usize>,
 ) -> Node {
     let blank = braille_cell(0, 0);
-    let lines = grid.iter().enumerate().map(|(r, line)| {
-        let mut spans = Vec::new();
-        let mut run = String::new();
-        let mut tok = "";
-        for x in cols.clone() {
-            let ch = line[x];
-            let t = match (ink, ch == blank) {
-                (_, true) => "",
-                (Ink::Load, false) => cx.load(col_pct[x]),
-                (Ink::Series(s), false) => cx.series(s),
-            };
-            if t != tok && !run.is_empty() {
-                spans.push(sp(std::mem::take(&mut run), tok));
-            }
-            tok = t;
-            run.push(ch);
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut tok = "";
+    for x in cols {
+        let ch = line[x];
+        let t = match (ink, ch == blank) {
+            (_, true) => "",
+            (Ink::Load, false) => cx.load(col_pct[x]),
+            (Ink::Series(s), false) => cx.series(s),
+        };
+        if t != tok && !run.is_empty() {
+            spans.push(sp(std::mem::take(&mut run), tok));
         }
-        if !run.is_empty() {
-            spans.push(sp(run, tok));
-        }
-        // a cell too many cuts the oldest end, never wraps the graph
-        Node::new(format!("{id}.{r}"), "text")
-            .prop("spans", spans)
-            .prop("wrap", "none")
-            .prop("truncate", "start")
-    });
-    Node::new(id, "col").prop("align", "end").children(lines)
+        tok = t;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(sp(run, tok));
+    }
+    // a cell too many cuts the oldest end, never wraps the graph
+    Node::new(id, "text")
+        .prop("spans", spans)
+        .prop("wrap", "none")
+        .prop("truncate", "start")
 }
 
 fn card(id: &str, head: Vec<Value>) -> Node {
@@ -487,7 +531,10 @@ fn cpu(app: &App, cx: &Ctx, p: &Plan) -> Node {
     if !ident.is_empty() {
         head.push(sp(format!("  {}", ident.join(" ")), "muted"));
     }
-    head.push(sp(format!("  {total:.1}%"), load_tone(total)));
+    head.push(sp(
+        format!("  {}%", right(format!("{total:.1}"), 5)),
+        load_tone(total),
+    ));
     if let Some(up) = app.uptime_secs {
         head.push(sp(format!("  up {}", duration_short(up)), "muted"));
     }
@@ -518,40 +565,44 @@ fn cpu(app: &App, cx: &Ctx, p: &Plan) -> Node {
 
     let mut c = card("cpu", head);
     if p.cores_mid {
-        // the graph spans the card; the meters box covers its middle and the
-        // history shows on both sides of it, as in the ratatui panel
+        // one graph across the card; the meters box covers only its own rows
+        // in the middle, so the history runs behind it, as in the ratatui panel
         let (grid, col_pct) =
             graph_grid(&app.cpu_history, Some(100.0), p.graph_cells, p.graph_rows);
-        let left = p.graph_cells.saturating_sub(p.box_cells) / 2;
-        let right = (left + p.box_cells).min(p.graph_cells);
-        let w = json!({"w": format!("{}ch", p.box_cells)});
-        c = c.child(
-            Node::new("cpu.body", "row")
-                .prop("justify", "between")
-                .child(graph_cols(
-                    cx,
-                    "cpu.hl",
-                    &grid,
-                    &col_pct,
-                    &Ink::Load,
-                    0..left,
-                ))
+        let w = p.graph_cells;
+        let left = w.saturating_sub(p.box_cells) / 2;
+        let right = (left + p.box_cells).min(w);
+        let top = p.graph_rows.saturating_sub(p.box_lines) / 2;
+        let under = (top + p.box_lines).min(p.graph_rows);
+        let row =
+            |id: String, r: usize, cols| graph_row(cx, &id, &grid[r], &col_pct, &Ink::Load, cols);
+        let side = |id: &str, cols: std::ops::Range<usize>| {
+            Node::new(id, "col")
+                .children((top..under).map(|r| row(format!("{id}.{r}"), r, cols.clone())))
+        };
+        let wide = json!({"w": format!("{}ch", p.box_cells)});
+        let tall = json!({"h": format!("{}lines", p.box_lines)});
+        let mut body = Node::new("cpu.graph", "col").prop("align", "end");
+        for r in 0..top {
+            body = body.child(row(format!("cpu.g{r}"), r, 0..w));
+        }
+        body = body.child(
+            Node::new("cpu.mid", "row")
+                .prop("align", "start")
+                .child(side("cpu.hl", 0..left))
                 .child(
                     Node::new("cpu.box", "card")
-                        .prop("min", w.clone())
-                        .prop("max", w)
+                        .prop("min", json!({"w": wide["w"], "h": tall["h"]}))
+                        .prop("max", json!({"w": wide["w"], "h": tall["h"]}))
                         .prop("shrink", 0)
                         .child(cores(app, p)),
                 )
-                .child(graph_cols(
-                    cx,
-                    "cpu.hr",
-                    &grid,
-                    &col_pct,
-                    &Ink::Load,
-                    right..p.graph_cells,
-                )),
+                .child(side("cpu.hr", right..w)),
         );
+        for r in under..p.graph_rows {
+            body = body.child(row(format!("cpu.g{r}"), r, 0..w));
+        }
+        c = c.child(body);
     } else {
         let hist = graph(
             cx,
@@ -584,8 +635,12 @@ fn cores(app: &App, p: &Plan) -> Node {
                 continue;
             };
             let label = match app.core_temps_c.get(i).filter(|t| !t.is_nan()) {
-                Some(t) => format!("{pct:5.1}% {t:3.0}°"),
-                None => format!("{pct:5.1}%"),
+                Some(t) => format!(
+                    "{}% {}°",
+                    right(format!("{pct:.1}"), 5),
+                    right(format!("{t:.0}"), 3)
+                ),
+                None => format!("{}%", right(format!("{pct:.1}"), 5)),
             };
             let id = format!("cpu.c{i}");
             row = row.child(
@@ -629,7 +684,10 @@ fn gpu(app: &App, cx: &Ctx, p: &Plan) -> Option<Node> {
     if let Some(name) = &app.gpu_name {
         head.push(sp(format!("  {name}"), "muted"));
     }
-    head.push(sp(format!("  {util:.1}%"), load_tone(util)));
+    head.push(sp(
+        format!("  {}%", right(format!("{util:.1}"), 5)),
+        load_tone(util),
+    ));
     // fixed 0..100 scale: it's a percentage, peak-scaling would just lie
     Some(card("gpu", head).child(graph(
         cx,
@@ -653,14 +711,27 @@ fn net(app: &App, cx: &Ctx, p: &Plan) -> Node {
     }
     let head = vec![
         sp("net", "strong"),
-        sp(count, "muted"),
+        sp(left(count, 22), "muted"),
         // aggregate rate now, cumulative since boot in parens
         sp(
-            format!("  ↓ {} ({})", rate(rx), humanize(app.net_rx_total)),
+            // padded after the whole readout, so what follows never moves
+            format!(
+                "  {}",
+                left(
+                    format!("↓ {} ({})", rate(rx), humanize(app.net_rx_total)),
+                    25
+                )
+            ),
             cx.series("rx"),
         ),
         sp(
-            format!("  ↑ {} ({})", rate(tx), humanize(app.net_tx_total)),
+            format!(
+                "  {}",
+                left(
+                    format!("↑ {} ({})", rate(tx), humanize(app.net_tx_total)),
+                    25
+                )
+            ),
             cx.series("tx"),
         ),
     ];
@@ -680,16 +751,22 @@ fn net(app: &App, cx: &Ctx, p: &Plan) -> Node {
             .child(
                 text(
                     format!("{id}.r"),
-                    vec![sp("↓ ", cx.series("rx")), sp(rate(i.rx_bps), "mono")],
+                    vec![
+                        sp("↓ ", cx.series("rx")),
+                        sp(right(rate(i.rx_bps), RATE_W), "mono"),
+                    ],
                 )
-                .prop("min", json!({"w": "13ch"})),
+                .prop("min", json!({"w": "14ch"})),
             )
             .child(
                 text(
                     format!("{id}.t"),
-                    vec![sp("↑ ", cx.series("tx")), sp(rate(i.tx_bps), "mono")],
+                    vec![
+                        sp("↑ ", cx.series("tx")),
+                        sp(right(rate(i.tx_bps), RATE_W), "mono"),
+                    ],
                 )
-                .prop("min", json!({"w": "13ch"})),
+                .prop("min", json!({"w": "14ch"})),
             );
         if let Some((rx_h, tx_h)) = app.net_hist.get(&i.name) {
             let spark = |side: &str, h: &VecDeque<f64>, series| {
@@ -699,7 +776,7 @@ fn net(app: &App, cx: &Ctx, p: &Plan) -> Node {
                     h,
                     None,
                     p.spark_cells,
-                    1,
+                    p.spark_rows,
                     Ink::Series(series),
                 )
                 .prop("grow", 1)
@@ -727,27 +804,32 @@ fn dsk(app: &App, cx: &Ctx, p: &Plan) -> Node {
     let hidden = app.disks.len() - disks.len();
     let mut head = vec![
         sp("dsk", "strong"),
-        sp(format!("  io {}", rate(io)), cx.series("io")),
+        sp(
+            format!("  {}", left(format!("io {}", rate(io)), 15)),
+            cx.series("io"),
+        ),
     ];
     if hidden > 0 {
         head.push(sp(format!("  +{hidden} idle"), "muted"));
     }
     let mut c = card("dsk", head);
     if !disks.is_empty() {
-        let dash = || json!("—");
+        // every cell at a fixed width, so a reading that gains a digit does
+        // not resize its column and shift the ones after it
+        let dash = |w| json!(right("—", w));
         let rows: Vec<Value> = disks
             .iter()
             .map(|d| {
                 json!({"id": d.name, "cells": {
-                    "name": d.name,
-                    "r": rate(d.read_bps),
-                    "w": rate(d.write_bps),
-                    "iops": format!("{:.0}", d.iops),
-                    "util": d.util_pct.map_or_else(dash, |u| json!({"meter": {
+                    "name": left(&d.name, 8),
+                    "r": right(rate(d.read_bps), RATE_W),
+                    "w": right(rate(d.write_bps), RATE_W),
+                    "iops": right(format!("{:.0}", d.iops), 7),
+                    "util": d.util_pct.map_or_else(|| dash(1), |u| json!({"meter": {
                         "value": frac(u), "tone": load_tone(u), "title": format!("{u:.1}% busy"),
                     }})),
-                    "lat": d.lat_ms.map_or_else(dash, |v| json!(format!("{v:.2}ms"))),
-                    "q": d.queue.map_or_else(dash, |v| json!(format!("{v:.1}"))),
+                    "lat": d.lat_ms.map_or_else(|| dash(8), |v| json!(right(format!("{v:.2}ms"), 8))),
+                    "q": d.queue.map_or_else(|| dash(5), |v| json!(right(format!("{v:.1}"), 5))),
                 }})
             })
             .collect();
@@ -853,7 +935,12 @@ fn bench(b: &BenchState) -> Node {
                 .prop(
                     "label",
                     vec![sp(
-                        format!("{} {:>3.0}% {}", kind.label(), done * 100.0, rate(bps)),
+                        format!(
+                            "{} {}% {}",
+                            left(kind.label(), 10),
+                            right(format!("{:.0}", done * 100.0), 3),
+                            right(rate(bps), RATE_W)
+                        ),
                         "mono",
                     )],
                 ),
@@ -884,7 +971,7 @@ fn bench(b: &BenchState) -> Node {
 fn gauge(id: &str, label: &str, label_w: usize, part: u64, whole: u64, capacity: bool) -> Node {
     let mut meter = Node::new(format!("{id}.m"), "meter")
         .prop("value", ratio(part, whole))
-        .prop("label", humanize(part))
+        .prop("label", right(humanize(part), 10))
         .prop("total", format!("/ {}", humanize(whole)))
         .prop("grow", 1);
     if capacity {
@@ -950,7 +1037,7 @@ fn procs(app: &App, plan: &Plan) -> Node {
     let mut head = vec![
         sp("proc", "strong"),
         sp(
-            format!("  {} procs · sort {sort}", app.procs.len()),
+            format!("  {} procs · sort {sort}", right(app.procs.len(), 5)),
             "muted",
         ),
     ];
@@ -1289,15 +1376,48 @@ mod tests {
     }
 
     #[test]
-    fn cpu_box_sits_over_the_middle_of_one_graph() {
-        // the ratatui panel: one graph across the card, the core box over its
-        // middle hiding those samples, older history out on the left
+    fn disk_cells_keep_their_width_as_readings_change() {
+        // Tern sizes a table column to its widest cell: a cell that grows a
+        // digit would shift every column right of it
+        let disk = |name: &str, bps: f64, lat: Option<f64>| crate::app::DiskRow {
+            name: name.into(),
+            read_bps: bps,
+            write_bps: bps,
+            iops: bps / 4096.0,
+            util_pct: Some(10.0),
+            queue: lat.map(|_| 0.3),
+            lat_ms: lat,
+            idle_secs: 0.0,
+        };
+        let mut app = App::default();
+        app.disks = vec![
+            disk("disk0", 1.1 * 1024.0, Some(0.14)),
+            disk("disk3", 34.0 * 1024.0 * 1024.0, Some(12.5)),
+            disk("sda", 0.0, None),
+        ];
+        let (doc, _) = build(&app, &CX);
+        let rows = find(&doc, "dsk.disks").unwrap().p["rows"].clone();
+        for col in ["name", "r", "w", "iops", "lat", "q"] {
+            let widths: Vec<usize> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["cells"][col].as_str().unwrap().chars().count())
+                .collect();
+            assert!(widths.windows(2).all(|w| w[0] == w[1]), "{col}: {widths:?}");
+        }
+    }
+
+    #[test]
+    fn cpu_graph_runs_behind_the_core_box() {
+        // the ratatui panel: one graph across the card, the core box over the
+        // middle of only its own rows; above and below it the graph is whole
         let mut app = App::default();
         app.core_percents = vec![10.0; 10];
         app.load_avg = Some([1.0, 1.0, 1.0]);
         app.cpu_history = (0..crate::app::HISTORY).map(|_| 100.0).collect();
         let p = plan(&app, &CX);
-        assert!(p.cores_mid);
+        assert!(p.cores_mid && p.graph_rows > p.box_lines);
         let (doc, _) = build(&app, &CX);
         let width = |id: &str| row_text(&find(&doc, id).unwrap().c[0]).chars().count();
         let (left, right) = (width("cpu.hl"), width("cpu.hr"));
@@ -1306,7 +1426,12 @@ mod tests {
             left.abs_diff(right) <= 1,
             "box off center: {left} | {right}"
         );
-        assert!(row_text(&find(&doc, "cpu.hl").unwrap().c[0]).contains('⣿'));
+        let graph = find(&doc, "cpu.graph").unwrap();
+        let whole = graph.c.iter().filter(|n| n.k == "text").count();
+        assert_eq!(whole, p.graph_rows - p.box_lines);
+        let bottom = graph.c.last().unwrap();
+        assert_eq!(row_text(bottom).chars().count(), p.graph_cells);
+        assert!(row_text(bottom).chars().all(|c| c == '⣿'));
     }
 
     fn snapshot(at: Instant, tick: u64) -> Box<Snapshot> {
