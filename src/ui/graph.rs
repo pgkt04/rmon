@@ -17,19 +17,23 @@ pub fn braille_cell(left: usize, right: usize) -> char {
 
 /// the graph as cells: `height` rows of `width` braille chars, top row first,
 /// and each cell column's peak as a percent of `max`. values are newest
-/// last and right-aligned, two per cell
+/// last and right-aligned, `per_cell` (1 or 2) to a cell: two gives finer
+/// bars, one keeps every bar in a cell of its own, so a bar's color is its
+/// own and the graph moves a whole cell per sample
 pub fn braille_grid(
     values: &[f64],
     max: f64,
     width: usize,
     height: usize,
+    per_cell: usize,
 ) -> (Vec<Vec<char>>, Vec<f64>) {
     let blank = vec![vec![braille_cell(0, 0); width]; height];
     if width == 0 || height == 0 || max <= 0.0 {
         return (blank, vec![0.0; width]);
     }
+    let per_cell = per_cell.clamp(1, 2);
     let max_levels = height * 4;
-    let cols = width * 2;
+    let cols = width * per_cell;
     let take = values.len().min(cols);
     let vals = &values[values.len() - take..];
 
@@ -39,7 +43,7 @@ pub fn braille_grid(
     for (i, v) in vals.iter().enumerate() {
         let frac = (v / max).clamp(0.0, 1.0);
         levels[start + i] = (frac * max_levels as f64).round() as usize;
-        let cx = (start + i) / 2;
+        let cx = (start + i) / per_cell;
         col_pct[cx] = col_pct[cx].max(frac * 100.0);
     }
 
@@ -48,8 +52,10 @@ pub fn braille_grid(
         // bottom text row holds levels 0..4, the one above 4..8, ...
         let row_base = (height - 1 - row) * 4;
         for (cx, cell) in cells.iter_mut().enumerate() {
-            let l = levels[cx * 2].saturating_sub(row_base).min(4);
-            let r = levels[cx * 2 + 1].saturating_sub(row_base).min(4);
+            let l = levels[cx * per_cell].saturating_sub(row_base).min(4);
+            let r = levels[cx * per_cell + per_cell - 1]
+                .saturating_sub(row_base)
+                .min(4);
             *cell = braille_cell(l, r);
         }
     }
@@ -75,6 +81,7 @@ impl Widget for BrailleGraph<'_> {
             self.max,
             area.width as usize,
             area.height as usize,
+            2,
         );
         for (row, cells) in rows.iter().enumerate() {
             for (cx, ch) in cells.iter().enumerate() {

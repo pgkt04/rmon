@@ -434,10 +434,11 @@ enum Ink {
     Series(&'static str),
 }
 
-/// a braille history graph as text rows of the ratatui graph's cells, so it
-/// scrolls a column per tick. (a `chart` replays its bar entry animation on
-/// every change, and only a stylesheet can stop that.) `max: None` scales
-/// to the peak in view over the ratatui 1 KiB/s floor
+/// a braille history graph as text rows, one sample per cell: each tick the
+/// graph moves a cell and draws the new sample in the same frame, and a bar
+/// keeps the color of its own load. (a `chart` replays its bar entry
+/// animation on every change, and only a stylesheet can stop that.) `max:
+/// None` scales to the peak in view over the ratatui 1 KiB/s floor
 fn graph(
     cx: &Ctx,
     id: &str,
@@ -463,7 +464,7 @@ fn graph_grid(
     cells: usize,
     rows: usize,
 ) -> (Vec<Vec<char>>, Vec<f64>) {
-    let take = hist.len().min(cells * 2);
+    let take = hist.len().min(cells);
     let mut vals: Vec<f64> = hist.iter().skip(hist.len() - take).copied().collect();
     let max = match max {
         Some(m) => m,
@@ -476,7 +477,7 @@ fn graph_grid(
             m
         }
     };
-    braille_grid(&vals, max, cells, rows)
+    braille_grid(&vals, max, cells, rows, 1)
 }
 
 /// cell columns `cols` of one graph row as a text node
@@ -1363,9 +1364,9 @@ mod tests {
         for row in &g.c {
             assert_eq!(row_text(row).chars().count(), 40);
         }
-        // the newest sample fills the right dot column of the last cell, to the top
+        // the newest sample fills the whole last cell, to the top
         let top = row_text(&g.c[0]);
-        assert_eq!(top.chars().last(), Some('⢸'));
+        assert_eq!(top.chars().last(), Some('⣿'));
         let last = g.c[0].p["spans"]
             .as_array()
             .unwrap()
@@ -1373,6 +1374,31 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(last["s"], json!("g10"));
+    }
+
+    #[test]
+    fn every_tick_moves_the_graph_one_cell_and_draws_the_new_sample() {
+        // one sample per cell: no cell is shared, so each tick every bar
+        // moves left whole with its own color while the newest appears
+        let series: Vec<f64> = (0..300).map(|i| ((i * 37) % 101) as f64).collect();
+        let at = |n: usize| {
+            let hist: VecDeque<f64> = series[..n].iter().copied().collect();
+            graph_grid(&hist, Some(100.0), 40, 3)
+        };
+        for (n, &newest) in series.iter().enumerate().take(140).skip(100) {
+            let (now, pct_now) = at(n);
+            let (next, pct_next) = at(n + 1);
+            for x in 0..39 {
+                assert_eq!(pct_next[x], pct_now[x + 1], "tick {n} cell {x}");
+                for r in 0..3 {
+                    assert_eq!(next[r][x], now[r][x + 1], "tick {n} row {r} cell {x}");
+                }
+            }
+            assert!(
+                (pct_next[39] - newest).abs() < 1e-9,
+                "tick {n}: the new sample is drawn"
+            );
+        }
     }
 
     #[test]
