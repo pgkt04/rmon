@@ -77,6 +77,12 @@ mod metric {
     pub const COL_GAP: f64 = 10.0 / LINE_PX;
     /// a card body's 36px + 12px side padding in cells, plus a cell of slack
     pub const CARD_CELLS: usize = 8;
+    /// an `inset` card's body has no padding but 1px under it, so its graph
+    /// can span the card the way the ratatui graph spans its box
+    pub const INSET_CARD: f64 = 1.0 + 13.0 / LINE_PX;
+    /// main's 16px side padding in cells (4.1), plus slack; the graph is
+    /// centered in what is left, so the slack splits into even margins
+    pub const INSET_CELLS: usize = 5;
 }
 
 /// "c00 " + a meter + " 100.0% 100°"
@@ -124,6 +130,7 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     use metric::*;
     let rows = cx.rows as f64;
     let inner = cx.cols.saturating_sub(CARD_CELLS);
+    let wide = cx.cols.saturating_sub(INSET_CELLS);
     // the band splits 45/55 around a 10px gap
     let dsk_cells = (cx.cols.saturating_sub(2) * 45 / 100).saturating_sub(CARD_CELLS);
 
@@ -142,8 +149,8 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     // over them and 6px under, and 12px a side
     let box_cells = core_cols * CORE_CELLS + 4;
     let box_lines = core_lines + 1;
-    let cores_mid = core_lines > 0 && inner >= box_cells + 20;
-    let graph_cells = inner;
+    let cores_mid = core_lines > 0 && wide >= box_cells + 20;
+    let graph_cells = wide;
     let graph_min = if cores_mid { box_lines.max(3) } else { 3 };
     let cpu_card = |g: usize| {
         let body = if cores_mid || core_lines == 0 {
@@ -156,7 +163,7 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
         } else {
             0.0
         };
-        CARD + body + status + BLOCK_GAP
+        INSET_CARD + body + status + BLOCK_GAP
     };
     let has_gpu = app.gpu_util_pct.is_some() || !app.gpu_hist.is_empty();
 
@@ -205,7 +212,7 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     let band = loop {
         let mut used = DOCK + MAIN_PAD + cpu_card(graph_rows);
         if has_gpu {
-            used += CARD + gpu_rows as f64 + BLOCK_GAP;
+            used += INSET_CARD + gpu_rows as f64 + BLOCK_GAP;
         }
         used += CARD + net_lines(spark_rows, net_cap) as f64 + BLOCK_GAP;
         // the band takes what is left, fraction and all: its rows fill the pane
@@ -250,7 +257,7 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
         cores_mid,
         box_cells,
         box_lines,
-        gpu_cells: inner,
+        gpu_cells: wide,
         gpu_rows,
         net_rows,
         spark_rows,
@@ -564,7 +571,7 @@ fn cpu(app: &App, cx: &Ctx, p: &Plan) -> Node {
         }
     }
 
-    let mut c = card("cpu", head);
+    let mut c = card("cpu", head).prop("inset", true);
     if p.cores_mid {
         // one graph across the card; the meters box covers only its own rows
         // in the middle, so the history runs behind it, as in the ratatui panel
@@ -583,13 +590,17 @@ fn cpu(app: &App, cx: &Ctx, p: &Plan) -> Node {
         };
         let wide = json!({"w": format!("{}ch", p.box_cells)});
         let tall = json!({"h": format!("{}lines", p.box_lines)});
-        let mut body = Node::new("cpu.graph", "col").prop("align", "end");
+        // the box is `ch` wide and a braille glyph a bit wider, so its row
+        // comes up short of the full rows: stretched to their width, it puts
+        // its side columns flush with their edges and the slack by the box
+        let mut plot = Node::new("cpu.plot", "col").prop("align", "stretch");
         for r in 0..top {
-            body = body.child(row(format!("cpu.g{r}"), r, 0..w));
+            plot = plot.child(row(format!("cpu.g{r}"), r, 0..w));
         }
-        body = body.child(
+        plot = plot.child(
             Node::new("cpu.mid", "row")
                 .prop("align", "start")
+                .prop("justify", "between")
                 .child(side("cpu.hl", 0..left))
                 .child(
                     Node::new("cpu.box", "card")
@@ -601,9 +612,13 @@ fn cpu(app: &App, cx: &Ctx, p: &Plan) -> Node {
                 .child(side("cpu.hr", right..w)),
         );
         for r in under..p.graph_rows {
-            body = body.child(row(format!("cpu.g{r}"), r, 0..w));
+            plot = plot.child(row(format!("cpu.g{r}"), r, 0..w));
         }
-        c = c.child(body);
+        c = c.child(
+            Node::new("cpu.graph", "col")
+                .prop("align", "center")
+                .child(plot),
+        );
     } else {
         let hist = graph(
             cx,
@@ -613,13 +628,24 @@ fn cpu(app: &App, cx: &Ctx, p: &Plan) -> Node {
             p.graph_cells,
             p.graph_rows,
             Ink::Load,
-        );
-        c = c.child(hist).child(cores(app, p));
+        )
+        .prop("align", "center");
+        c = c.child(hist).child(centered(p.graph_cells, cores(app, p)));
     }
     if let Some(err) = &app.status {
-        c = c.child(text("cpu.status", vec![sp(err.clone(), "error")]));
+        let err = text("cpu.status", vec![sp(err.clone(), "error")]);
+        c = c.child(centered(p.graph_cells, err));
     }
     c
+}
+
+/// `node` held to the width of the graph above it, under it in the middle
+/// of an `inset` card, which has no padding of its own
+fn centered(cells: usize, node: Node) -> Node {
+    let w = json!({"w": format!("{cells}ch")});
+    Node::new(format!("{}.at", node.id), "col")
+        .prop("align", "center")
+        .child(node.prop("min", w.clone()).prop("max", w))
 }
 
 /// per-core meters, column-major like the ratatui overlay, with the load
@@ -690,15 +716,20 @@ fn gpu(app: &App, cx: &Ctx, p: &Plan) -> Option<Node> {
         load_tone(util),
     ));
     // fixed 0..100 scale: it's a percentage, peak-scaling would just lie
-    Some(card("gpu", head).child(graph(
-        cx,
-        "gpu.hist",
-        &app.gpu_hist,
-        Some(100.0),
-        p.gpu_cells,
-        p.gpu_rows,
-        Ink::Load,
-    )))
+    Some(
+        card("gpu", head).prop("inset", true).child(
+            graph(
+                cx,
+                "gpu.hist",
+                &app.gpu_hist,
+                Some(100.0),
+                p.gpu_cells,
+                p.gpu_rows,
+                Ink::Load,
+            )
+            .prop("align", "center"),
+        ),
+    )
 }
 
 fn net(app: &App, cx: &Ctx, p: &Plan) -> Node {
@@ -1452,7 +1483,7 @@ mod tests {
             left.abs_diff(right) <= 1,
             "box off center: {left} | {right}"
         );
-        let graph = find(&doc, "cpu.graph").unwrap();
+        let graph = find(&doc, "cpu.plot").unwrap();
         let whole = graph.c.iter().filter(|n| n.k == "text").count();
         assert_eq!(whole, p.graph_rows - p.box_lines);
         let bottom = graph.c.last().unwrap();
