@@ -15,6 +15,47 @@ pub fn braille_cell(left: usize, right: usize) -> char {
     char::from_u32(0x2800 + bits as u32).expect("invariant: braille block is contiguous")
 }
 
+/// the graph as cells: `height` rows of `width` braille chars, top row first,
+/// and each cell column's peak as a percent of `max`. values are newest
+/// last and right-aligned, two per cell
+pub fn braille_grid(
+    values: &[f64],
+    max: f64,
+    width: usize,
+    height: usize,
+) -> (Vec<Vec<char>>, Vec<f64>) {
+    let blank = vec![vec![braille_cell(0, 0); width]; height];
+    if width == 0 || height == 0 || max <= 0.0 {
+        return (blank, vec![0.0; width]);
+    }
+    let max_levels = height * 4;
+    let cols = width * 2;
+    let take = values.len().min(cols);
+    let vals = &values[values.len() - take..];
+
+    let mut levels = vec![0usize; cols];
+    let mut col_pct = vec![0f64; width];
+    let start = cols - take;
+    for (i, v) in vals.iter().enumerate() {
+        let frac = (v / max).clamp(0.0, 1.0);
+        levels[start + i] = (frac * max_levels as f64).round() as usize;
+        let cx = (start + i) / 2;
+        col_pct[cx] = col_pct[cx].max(frac * 100.0);
+    }
+
+    let mut rows = blank;
+    for (row, cells) in rows.iter_mut().enumerate() {
+        // bottom text row holds levels 0..4, the one above 4..8, ...
+        let row_base = (height - 1 - row) * 4;
+        for (cx, cell) in cells.iter_mut().enumerate() {
+            let l = levels[cx * 2].saturating_sub(row_base).min(4);
+            let r = levels[cx * 2 + 1].saturating_sub(row_base).min(4);
+            *cell = braille_cell(l, r);
+        }
+    }
+    (rows, col_pct)
+}
+
 /// history graph; values 0..=max, newest last, right-aligned
 pub struct BrailleGraph<'a> {
     pub values: &'a [f64],
@@ -29,29 +70,16 @@ impl Widget for BrailleGraph<'_> {
         if area.is_empty() || self.max <= 0.0 {
             return;
         }
-        let max_levels = area.height as usize * 4;
-        let cols = area.width as usize * 2; // 2 value columns per char
-        let take = self.values.len().min(cols);
-        let vals = &self.values[self.values.len() - take..];
-
-        let mut levels = vec![0usize; cols];
-        let mut col_pct = vec![0f64; area.width as usize];
-        let start = cols - take;
-        for (i, v) in vals.iter().enumerate() {
-            let frac = (v / self.max).clamp(0.0, 1.0);
-            levels[start + i] = (frac * max_levels as f64).round() as usize;
-            let cx = (start + i) / 2;
-            col_pct[cx] = col_pct[cx].max(frac * 100.0);
-        }
-
-        for row in 0..area.height {
-            // bottom text row holds levels 0..4, the one above 4..8, ...
-            let row_base = (area.height - 1 - row) as usize * 4;
-            for cx in 0..area.width as usize {
-                let l = levels[cx * 2].saturating_sub(row_base).min(4);
-                let r = levels[cx * 2 + 1].saturating_sub(row_base).min(4);
-                if let Some(cell) = buf.cell_mut((area.x + cx as u16, area.y + row)) {
-                    cell.set_char(braille_cell(l, r));
+        let (rows, col_pct) = braille_grid(
+            self.values,
+            self.max,
+            area.width as usize,
+            area.height as usize,
+        );
+        for (row, cells) in rows.iter().enumerate() {
+            for (cx, ch) in cells.iter().enumerate() {
+                if let Some(cell) = buf.cell_mut((area.x + cx as u16, area.y + row as u16)) {
+                    cell.set_char(*ch);
                     let style = if self.gradient {
                         Style::new().fg(theme::gradient(col_pct[cx]))
                     } else {

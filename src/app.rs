@@ -23,6 +23,8 @@ pub enum AppEvent {
     Smart(Vec<SmartInfo>),
     /// handled in the run loop, which knows the frame size; never reaches on_event
     Mouse(MouseEvent),
+    /// a Tern Surface Protocol event; the native run loop consumes these
+    Tsp(crate::tsp::wire::Event),
     /// the input thread lost the tty; exit instead of running headless forever
     Quit,
 }
@@ -313,7 +315,7 @@ impl App {
             AppEvent::Snapshot(s) => self.apply(*s),
             AppEvent::CollectError(e) => self.status = Some(e),
             AppEvent::Smart(v) => self.smart = v,
-            AppEvent::Mouse(_) => {} // run loop consumes these before on_event
+            AppEvent::Mouse(_) | AppEvent::Tsp(_) => {} // run loops consume these before on_event
             AppEvent::Quit => self.quit = true,
             AppEvent::Bench(ev) => {
                 let st = self.bench.get_or_insert_with(BenchState::default);

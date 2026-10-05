@@ -2,7 +2,9 @@ mod app;
 mod bench;
 mod collect;
 mod fetch;
+mod native;
 mod smart;
+mod tsp;
 mod ui;
 mod update;
 
@@ -116,6 +118,12 @@ fn main() -> Result<()> {
             .ok(); // spawn failure just leaves the panel empty
     }
 
+    // inside Tern the panels go out as native nodes; everywhere else, or when
+    // the terminal does not answer the hello, ratatui paints cells as before
+    if let Some(probe) = tsp::probe::detect() {
+        return native::run(probe, rx, tx, &thread_pid, &update_ms);
+    }
+
     thread::spawn(move || {
         loop {
             match event::read() {
@@ -172,36 +180,44 @@ fn run(
                 let frame = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 ui::handle_mouse(&mut app, m, frame);
             }
-            Ok(ev) => {
-                app.on_event(ev);
-                update_ms.store(app.refresh_ms(), Relaxed);
-            }
+            Ok(ev) => app.on_event(ev),
             Err(_) => break,
         }
-        // clicks move the selection too, so this runs for every event kind:
-        // tell the collector which pid (if any) should pay for thread detail
-        thread_pid.store(
-            if app.show_threads {
-                app.selected_id.map(|(p, _)| p as i64).unwrap_or(-1)
-            } else {
-                -1
-            },
-            Relaxed,
-        );
-        // the picker (b key) chose a target; unwritable dirs surface as a
-        // clean bench error in the panel, so no probe needed here
-        if let Some(target) = app.bench_target.take() {
-            let bench_tx = tx_bench.clone();
-            thread::spawn(move || {
-                let cfg = bench::BenchConfig {
-                    target_dir: target,
-                    ..Default::default()
-                };
-                bench::run(&cfg, &mut |ev| {
-                    let _ = bench_tx.send(AppEvent::Bench(ev));
-                });
-            });
-        }
+        sync_workers(&mut app, thread_pid, update_ms, &tx_bench);
     }
     Ok(())
+}
+
+/// after every event, whichever backend: publish the refresh cadence, tell
+/// the collector which pid pays for thread detail, start a chosen bench
+pub(crate) fn sync_workers(
+    app: &mut App,
+    thread_pid: &AtomicI64,
+    update_ms: &AtomicU64,
+    tx_bench: &mpsc::Sender<AppEvent>,
+) {
+    update_ms.store(app.refresh_ms(), Relaxed);
+    // clicks move the selection too, so this runs for every event kind
+    thread_pid.store(
+        if app.show_threads {
+            app.selected_id.map(|(p, _)| p as i64).unwrap_or(-1)
+        } else {
+            -1
+        },
+        Relaxed,
+    );
+    // the picker (b key) chose a target; unwritable dirs surface as a
+    // clean bench error in the panel, so no probe needed here
+    if let Some(target) = app.bench_target.take() {
+        let bench_tx = tx_bench.clone();
+        thread::spawn(move || {
+            let cfg = bench::BenchConfig {
+                target_dir: target,
+                ..Default::default()
+            };
+            bench::run(&cfg, &mut |ev| {
+                let _ = bench_tx.send(AppEvent::Bench(ev));
+            });
+        });
+    }
 }

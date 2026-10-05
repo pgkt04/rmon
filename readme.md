@@ -13,7 +13,7 @@ The disk benchmark measures sequential read/write MB/s and random 4k
 iops with latency percentiles. Results append to
 ~/.rmon/bench_history.jsonl.
 
-Runs on Linux and macOS.
+Runs on Linux and macOS, and supports the [Tern](https://stencil.so/tern) terminal.
 
 install:
 

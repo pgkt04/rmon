@@ -12,6 +12,32 @@ pub struct FetchInfo {
     pub lines: Vec<(String, String)>,
 }
 
+/// upper bound on live_lines rows; popup_rect sizes against it so the rect
+/// never depends on App state the mouse handler can't see
+pub const MAX_LIVE_LINES: usize = 4;
+
+/// rows read off the live App each draw; the popup puts them under `lines`
+pub fn live_lines(app: &crate::app::App) -> Vec<(String, String)> {
+    use crate::ui::fmt::{duration_short, humanize};
+    let mut out = Vec::with_capacity(MAX_LIVE_LINES);
+    if let Some(c) = &app.cpu_name {
+        out.push(("cpu".into(), c.clone()));
+    }
+    if let Some(g) = &app.gpu_name {
+        out.push(("gpu".into(), g.clone()));
+    }
+    if app.mem.total > 0 {
+        out.push((
+            "memory".into(),
+            format!("{} / {}", humanize(app.mem.used), humanize(app.mem.total)),
+        ));
+    }
+    if let Some(u) = app.uptime_secs {
+        out.push(("uptime".into(), duration_short(u)));
+    }
+    out
+}
+
 /// gather what we can; a field that fails to read just doesn't get a row
 pub fn collect() -> FetchInfo {
     let mut lines: Vec<(String, String)> = Vec::new();

@@ -4,34 +4,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use super::fmt::{duration_short, humanize};
 use super::theme;
 use crate::app::App;
-use crate::fetch::FetchInfo;
-
-/// upper bound on live_lines rows; popup_rect sizes against it so the rect
-/// never depends on App state the mouse handler can't see
-const MAX_LIVE_LINES: usize = 4;
-
-fn live_lines(app: &App) -> Vec<(String, String)> {
-    let mut out = Vec::with_capacity(MAX_LIVE_LINES);
-    if let Some(c) = &app.cpu_name {
-        out.push(("cpu".into(), c.clone()));
-    }
-    if let Some(g) = &app.gpu_name {
-        out.push(("gpu".into(), g.clone()));
-    }
-    if app.mem.total > 0 {
-        out.push((
-            "memory".into(),
-            format!("{} / {}", humanize(app.mem.used), humanize(app.mem.total)),
-        ));
-    }
-    if let Some(u) = app.uptime_secs {
-        out.push(("uptime".into(), duration_short(u)));
-    }
-    out
-}
+use crate::fetch::{FetchInfo, MAX_LIVE_LINES, live_lines};
 
 fn logo_width(info: &FetchInfo) -> usize {
     info.logo

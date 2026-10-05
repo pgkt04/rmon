@@ -2,7 +2,7 @@ mod confirm;
 mod cpu;
 mod dsk;
 mod fetch;
-mod fmt;
+pub(crate) mod fmt;
 mod gpu;
 mod graph;
 mod mem;
@@ -10,9 +10,10 @@ mod meter;
 mod net;
 mod picker;
 mod proc;
-mod theme;
+pub(crate) mod theme;
 
 pub use graph::BrailleGraph;
+pub(crate) use graph::{braille_cell, braille_grid};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
