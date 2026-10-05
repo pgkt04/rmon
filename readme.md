@@ -4,6 +4,8 @@ Terminal system monitor with disk benchmarking.
 
 ![rmon](media/demo.png)
 
+![rmon](media/tern.png)
+
 Panels for cpu, gpu, network, disks, processes, and memory. Process
 tree, per-process threads, live filtering, kill, mouse support.
 Network and disk rows hide when idle and appear when they see
