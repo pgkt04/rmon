@@ -27,17 +27,19 @@ pub struct Probe {
     pub early: Vec<Input>,
 }
 
-/// multiplexers swallow APC, so the reply could never come back;
-/// `RMON_TSP=0` keeps the ratatui renderer
+/// multiplexers swallow APC, so the reply could never come back; rmux sets
+/// `RMUX_TSP=1` while it passes TSP through. `RMON_TSP=0` keeps the ratatui
+/// renderer
 fn wanted(env: impl Fn(&str) -> Option<String>) -> bool {
     if env("RMON_TSP").as_deref() == Some("0") {
         return false;
     }
-    if ["TMUX", "STY", "ZELLIJ"]
-        .iter()
-        .any(|v| env(v).is_some_and(|s| !s.is_empty()))
-    {
+    let set = |v: &str| env(v).is_some_and(|s| !s.is_empty());
+    if ["TMUX", "STY", "ZELLIJ"].iter().any(|v| set(v)) {
         return false;
+    }
+    if env("RMUX_TSP").as_deref() == Some("1") {
+        return true;
     }
     let term = env("TERM").unwrap_or_default().to_ascii_lowercase();
     !(term.starts_with("tmux") || term.starts_with("screen") || term == "dumb" || term == "linux")
@@ -134,6 +136,16 @@ mod tests {
         assert!(!wanted(env(&[("TMUX", "/tmp/tmux-501/default,1,0")])));
         assert!(!wanted(env(&[("TERM", "screen-256color")])));
         assert!(!wanted(env(&[("ZELLIJ", "0")])));
+    }
+
+    #[test]
+    fn probes_inside_rmux_but_not_tmux_under_it() {
+        let rmux = ("RMUX_TSP", "1");
+        let term = ("TERM", "tmux-256color");
+        assert!(wanted(env(&[rmux, term])));
+        assert!(!wanted(env(&[("RMUX_TSP", "0"), term])));
+        assert!(!wanted(env(&[rmux, ("TMUX", "/tmp/tmux-501/default,2,0")])));
+        assert!(!wanted(env(&[rmux, ("RMON_TSP", "0")])));
     }
 
     #[test]
