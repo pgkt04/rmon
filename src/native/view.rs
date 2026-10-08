@@ -206,9 +206,18 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     let mut graph_rows = target.max(graph_min);
     let mut gpu_rows = GPU_ROWS;
     let mut spark_rows = SPARK_ROWS;
-    let ifaces = app.visible_net().len().max(1);
+    let ifaces = app.visible_net().len();
     let mut net_cap = NET_LINES;
-    let net_lines = |spark: usize, cap: usize| (ifaces * spark).min(cap).max(spark.min(cap));
+    // with no interface to show, the card holds its one "no active
+    // interfaces" line; planning spark rows for it would cut the dsk side's
+    // cap a line short of the band the procs stretch to
+    let net_lines = |spark: usize, cap: usize| {
+        if ifaces == 0 {
+            1
+        } else {
+            (ifaces * spark).min(cap)
+        }
+    };
     let band = loop {
         let mut used = DOCK + MAIN_PAD + cpu_card(graph_rows);
         if has_gpu {
@@ -1489,6 +1498,30 @@ mod tests {
         let bottom = graph.c.last().unwrap();
         assert_eq!(row_text(bottom).chars().count(), p.graph_cells);
         assert!(row_text(bottom).chars().all(|c| c == '⣿'));
+    }
+
+    #[test]
+    fn a_quiet_net_card_leaves_its_spare_line_to_the_band() {
+        // until the first rates land no interface shows and the net card is
+        // one line; planned as spark rows, the dsk side's cap fell a line
+        // short of the band and stopped above the bottom of the procs
+        let quiet = App::default();
+        let mut busy = App::default();
+        busy.net_ifaces = vec![crate::app::NetRow {
+            name: "en0".into(),
+            rx_bps: 1.0,
+            tx_bps: 1.0,
+            idle_secs: 0.0,
+        }];
+        let (q, b) = (plan(&quiet, &CX), plan(&busy, &CX));
+        assert_eq!(b.net_rows, SPARK_ROWS);
+        let spare = (SPARK_ROWS - 1) as f64;
+        assert!(
+            (q.band - b.band - spare).abs() < 1e-9,
+            "quiet band {} vs busy band {}",
+            q.band,
+            b.band
+        );
     }
 
     fn snapshot(at: Instant, tick: u64) -> Box<Snapshot> {
