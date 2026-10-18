@@ -247,7 +247,9 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     let net_rows = net_lines(spark_rows, net_cap);
 
     let proc_rows = (((band - CARD - filter - ROW - INNER_GAP) / ROW).floor() as usize).max(3);
-    // spare dsk lines go to disk rows first, then to the io graph
+    // spare dsk lines go to disk rows first, then the io graph takes every
+    // line the card has left: the card stretches to the band beside the
+    // procs, and the ratatui graph runs to the bottom of its panel
     let mut left = band - mem_card - COL_GAP - CARD - fixed;
     let mut disk_rows = 0;
     if disks > 0 {
@@ -257,7 +259,7 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     }
     let io_rows = match left.floor() as usize {
         r if r < 2 => 0,
-        r => r.min(8),
+        r => r,
     };
     Plan {
         graph_cells,
@@ -887,8 +889,14 @@ fn dsk(app: &App, cx: &Ctx, p: &Plan) -> Node {
                 {"id": "q", "head": "queue", "align": "end", "priority": 1},
             ]),
         );
-        let lines = metric::TABLE_HEAD + metric::ROW * p.disk_rows as f64;
-        c = c.child(scroller("dsk.scroll", lines).child(table));
+        // held at the whole lines the plan gave it, so the io graph under it
+        // ends on the card's last line rather than up to a line above it
+        let lines = (metric::TABLE_HEAD + metric::ROW * p.disk_rows as f64).ceil();
+        c = c.child(
+            scroller("dsk.scroll", lines)
+                .prop("min", json!({"h": format!("{lines}lines")}))
+                .child(table),
+        );
     }
     if !app.mounts.is_empty() {
         // one meter line per mount, as in the ratatui panel
@@ -1522,6 +1530,84 @@ mod tests {
             q.band,
             b.band
         );
+    }
+
+    #[test]
+    fn the_dsk_io_graph_takes_every_line_the_card_has_left() {
+        // the dsk card stretches to the height of the procs beside it; an io
+        // graph capped at 8 rows left most of a tall card empty under it
+        use super::metric::*;
+        let cx = Ctx {
+            cols: 161,
+            rows: 95,
+            palette: true,
+        };
+        let mut app = App::default();
+        app.net_ifaces = vec![crate::app::NetRow {
+            name: "en0".into(),
+            rx_bps: 1.0,
+            tx_bps: 1.0,
+            idle_secs: 0.0,
+        }];
+        app.disks = (0..18)
+            .map(|i| crate::app::DiskRow {
+                name: format!("sd{i}"),
+                read_bps: 1.0,
+                write_bps: 1.0,
+                iops: 1.0,
+                util_pct: Some(1.0),
+                queue: None,
+                lat_ms: None,
+                idle_secs: 0.0,
+            })
+            .collect();
+        app.mounts = vec![
+            MountInfo {
+                mount_point: "/".into(),
+                total: 100 << 30,
+                available: 40 << 30,
+            },
+            MountInfo {
+                mount_point: "/boot/efi".into(),
+                total: 1 << 30,
+                available: 1 << 29,
+            },
+        ];
+        app.disk_io = (0..crate::app::HISTORY).map(|_| 1e6).collect();
+        let p = plan(&app, &cx);
+        assert_eq!(p.disk_rows, 18);
+        // the band less mem (a head and its two meters) and the gap over it
+        let dsk_card = p.band - (CARD + 2.0) - COL_GAP;
+        // the head and body padding, the table's whole lines, the two mount
+        // lines, each followed by the body gap; the graph gets what is left
+        let table = (TABLE_HEAD + ROW * 18.0).ceil() + INNER_GAP;
+        let mounts = 2.0 + INNER_GAP;
+        let rest = dsk_card - CARD - table - mounts;
+        assert_eq!(p.io_rows, rest.floor() as usize);
+        assert_eq!(p.io_rows, 29);
+        // no line to spare under the graph, and none past the card
+        let used = CARD + table + mounts + p.io_rows as f64;
+        assert!(
+            used <= dsk_card && dsk_card - used < 1.0,
+            "{used} lines in a {dsk_card}-line card"
+        );
+        // everything over the band and the band itself fit the pane
+        let over = DOCK
+            + MAIN_PAD
+            + INSET_CARD
+            + p.graph_rows as f64
+            + BLOCK_GAP
+            + CARD
+            + p.net_rows as f64
+            + BLOCK_GAP;
+        assert!(over + p.band <= cx.rows as f64 + 1e-9);
+        let (doc, _) = build(&app, &cx);
+        assert_eq!(find(&doc, "dsk.io").unwrap().c.len(), p.io_rows);
+        // the table holds its planned whole lines, so the graph under it
+        // ends on the card's last line
+        let scroll = &find(&doc, "dsk.scroll").unwrap().p;
+        assert_eq!(scroll["min"], scroll["max"]);
+        assert_eq!(scroll["max"], json!({"h": "27lines"}));
     }
 
     fn snapshot(at: Instant, tick: u64) -> Box<Snapshot> {
