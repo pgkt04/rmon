@@ -146,9 +146,10 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
     let core_lines = n.div_ceil(core_cols) + load;
     // a headless card a whole number of graph rows tall, so the graph rows
     // above and below it stay on their grid: the meters plus 10px of padding
-    // over them and 6px under, and 12px a side
+    // over and under them, and 12px a side. 20px is more than a line, so it
+    // takes two; a box any shorter cuts the load line, and Tern fades a cut
     let box_cells = core_cols * CORE_CELLS + 4;
-    let box_lines = core_lines + 1;
+    let box_lines = core_lines + 2;
     let cores_mid = core_lines > 0 && wide >= box_cells + 20;
     let graph_cells = wide;
     let graph_min = if cores_mid { box_lines.max(3) } else { 3 };

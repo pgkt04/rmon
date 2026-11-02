@@ -22,11 +22,13 @@ use crate::tsp::wire::{self, Event, Hello, Incoming};
 use view::SF;
 
 /// cosmetic only, for terminals that take stylesheets: the capped net and
-/// disk lists scroll instead of clipping, and a proc row's numbers keep their
-/// width while the name truncates, like the ratatui table. the layout itself
+/// disk lists scroll instead of clipping, a proc row's numbers keep their
+/// width while the name truncates, like the ratatui table, and the core
+/// meters sit in the middle of their box's spare line. the layout itself
 /// never depends on it (view::plan)
 const CSS: &str = "[data-role='rmon.scroll']{overflow-y:auto}\
-    [data-id='proc'] .sf-item-value{max-width:none;flex-shrink:0}";
+    [data-id='proc'] .sf-item-value{max-width:none;flex-shrink:0}\
+    [data-id='cpu.box']{display:flex;flex-direction:column;justify-content:center}";
 /// the net and dsk series colors of the ratatui theme
 const PALETTE_DARK: [(&str, &str); 3] = [("rx", "#78c8ff"), ("tx", "#ffaa6e"), ("io", "#be8cff")];
 const PALETTE_LIGHT: [(&str, &str); 3] = [("rx", "#1f6fb2"), ("tx", "#b8581a"), ("io", "#7a3fc4")];
