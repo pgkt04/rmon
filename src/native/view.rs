@@ -96,6 +96,11 @@ const SPARK_ROWS: usize = 2;
 const MOUNT_ROWS: usize = 6;
 /// the fewest proc rows worth a band
 const PROC_MIN: usize = 5;
+/// the band is planned this much under what the pane leaves it. both sides
+/// stretch to the band, so a short plan only leaves room under the graph and
+/// the procs, while a host whose chrome runs a few px over Tern's (rsttyd's
+/// dock) would push the band's bottom edge under the dock
+const BAND_SLACK: f64 = 0.5;
 
 /// what each panel gets of the pane, the way the ratatui layout splits the
 /// terminal: cpu takes 30%, gpu and net fixed rows, the dsk|proc band the
@@ -117,7 +122,6 @@ struct Plan {
     net_rows: usize,
     spark_rows: usize,
     spark_cells: usize,
-    band: f64,
     proc_rows: usize,
     disk_rows: usize,
     mount_rows: usize,
@@ -225,8 +229,9 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
             used += INSET_CARD + gpu_rows as f64 + BLOCK_GAP;
         }
         used += CARD + net_lines(spark_rows, net_cap) as f64 + BLOCK_GAP;
-        // the band takes what is left, fraction and all: its rows fill the pane
-        let band = rows - used;
+        // the band takes what is left, fraction and all, less the slack: its
+        // rows fill the pane
+        let band = rows - used - BAND_SLACK;
         let short = band_min - band;
         if short <= 0.0 {
             break band;
@@ -275,7 +280,6 @@ fn plan(app: &App, cx: &Ctx) -> Plan {
         spark_rows,
         // the name, two 14-cell rates and the gaps between them take 43 cells
         spark_cells: inner.saturating_sub(43) / 2,
-        band,
         proc_rows,
         disk_rows,
         mount_rows,
@@ -305,19 +309,20 @@ pub fn build(app: &App, cx: &Ctx) -> (Node, Option<String>) {
     main.push(net(app, cx, &p));
     main.push(
         // the band grows into whatever `main` has left, both sides stretched
-        // to it, so the panels reach the bottom of the pane like ratatui's
+        // to it, so the panels reach the bottom of the pane like ratatui's.
+        // neither side is capped: the plan's lines are px over 16, and a host
+        // whose line or chrome is not Tern 0.4.5's puts a cut short of the
+        // other side, so the mem card ends above the procs. a side that does
+        // outgrow the band stretches the other with it, and main scrolls
         Node::new("band", "row")
             .prop("gap", "md")
             .prop("align", "stretch")
             .prop("grow", 1)
             .child(
-                // the dsk side is the one whose content can outgrow its
-                // share (a bench, many mounts): cut it at the band
                 Node::new("band.l", "col")
                     .prop("gap", "md")
                     .prop("basis", 0.45)
                     .prop("grow", 1)
-                    .prop("max", json!({"h": format!("{}lines", p.band.ceil())}))
                     .child(dsk(app, cx, &p).prop("grow", 1))
                     .child(mem(app, &p)),
             )
@@ -1512,8 +1517,8 @@ mod tests {
     #[test]
     fn a_quiet_net_card_leaves_its_spare_line_to_the_band() {
         // until the first rates land no interface shows and the net card is
-        // one line; planned as spark rows, the dsk side's cap fell a line
-        // short of the band and stopped above the bottom of the procs
+        // one line; planned as spark rows, the band lost a line and the io
+        // graph stopped a line short of the bottom of the dsk card
         let quiet = App::default();
         let mut busy = App::default();
         busy.net_ifaces = vec![crate::app::NetRow {
@@ -1524,12 +1529,13 @@ mod tests {
         }];
         let (q, b) = (plan(&quiet, &CX), plan(&busy, &CX));
         assert_eq!(b.net_rows, SPARK_ROWS);
-        let spare = (SPARK_ROWS - 1) as f64;
-        assert!(
-            (q.band - b.band - spare).abs() < 1e-9,
-            "quiet band {} vs busy band {}",
-            q.band,
-            b.band
+        let spare = SPARK_ROWS - 1;
+        assert_eq!(
+            q.io_rows,
+            b.io_rows + spare,
+            "quiet io rows {} vs busy io rows {}",
+            q.io_rows,
+            b.io_rows
         );
     }
 
@@ -1577,8 +1583,18 @@ mod tests {
         app.disk_io = (0..crate::app::HISTORY).map(|_| 1e6).collect();
         let p = plan(&app, &cx);
         assert_eq!(p.disk_rows, 18);
+        // the band is what the cards over it leave of the pane, less the slack
+        let over = DOCK
+            + MAIN_PAD
+            + INSET_CARD
+            + p.graph_rows as f64
+            + BLOCK_GAP
+            + CARD
+            + p.net_rows as f64
+            + BLOCK_GAP;
+        let band = cx.rows as f64 - over - BAND_SLACK;
         // the band less mem (a head and its two meters) and the gap over it
-        let dsk_card = p.band - (CARD + 2.0) - COL_GAP;
+        let dsk_card = band - (CARD + 2.0) - COL_GAP;
         // the head and body padding, the table's whole lines, the two mount
         // lines, each followed by the body gap; the graph gets what is left
         let table = (TABLE_HEAD + ROW * 18.0).ceil() + INNER_GAP;
@@ -1592,16 +1608,6 @@ mod tests {
             used <= dsk_card && dsk_card - used < 1.0,
             "{used} lines in a {dsk_card}-line card"
         );
-        // everything over the band and the band itself fit the pane
-        let over = DOCK
-            + MAIN_PAD
-            + INSET_CARD
-            + p.graph_rows as f64
-            + BLOCK_GAP
-            + CARD
-            + p.net_rows as f64
-            + BLOCK_GAP;
-        assert!(over + p.band <= cx.rows as f64 + 1e-9);
         let (doc, _) = build(&app, &cx);
         assert_eq!(find(&doc, "dsk.io").unwrap().c.len(), p.io_rows);
         // the table holds its planned whole lines, so the graph under it
