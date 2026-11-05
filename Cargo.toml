@@ -1,6 +1,6 @@
 [package]
 name = "rmon"
-version = "1.5.3"
+version = "1.5.4"
 edition = "2024"
 description = "Terminal system monitor with disk benchmarking"
 license = "MIT"
